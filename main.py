@@ -9,8 +9,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import signal
 import sys
+import time
+from pathlib import Path
 
 import uvicorn
 from starlette.types import ASGIApp
@@ -95,6 +98,94 @@ class _Server(uvicorn.Server):
         pass
 
 
+# --------------------------------------------------------------------------------------
+# PID file: lets ``main.py --stop`` shut a detached run down cleanly
+# --------------------------------------------------------------------------------------
+
+PID_FILE = Path(
+    os.environ.get("OPENSTACK_SIMULATOR_PID_FILE", "openstack-simulator.pid")
+)
+
+
+def _process_alive(pid: int) -> bool:
+    """True only if the pid exists *and* still looks like this simulator.
+
+    Guards against a recycled pid: killing whatever happens to own that number
+    later would be far worse than refusing to act.
+    """
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    cmdline = Path(f"/proc/{pid}/cmdline")
+    if cmdline.exists():  # Linux: confirm it is really our entry point
+        return "main.py" in cmdline.read_bytes().decode(errors="replace")
+    return True
+
+
+def _read_pid() -> int | None:
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    return pid if _process_alive(pid) else None
+
+
+def _write_pid() -> None:
+    PID_FILE.write_text(f"{os.getpid()}\n")
+
+
+def _clear_pid() -> None:
+    with contextlib.suppress(FileNotFoundError):
+        PID_FILE.unlink()
+
+
+def stop(timeout: float = 15.0) -> int:
+    """Ask a detached run to shut down, then wait for it to actually exit."""
+    pid = _read_pid()
+    if pid is None:
+        if PID_FILE.exists():
+            _clear_pid()
+            print(f"No simulator running (cleared stale {PID_FILE}).")
+        else:
+            print("No simulator running.")
+        return 0
+
+    print(f"Stopping OpenStack-Simulator (pid {pid})...", flush=True)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _clear_pid()
+        print("Already gone.")
+        return 0
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_alive(pid):
+            _clear_pid()
+            print("Stopped.")
+            return 0
+        time.sleep(0.2)
+
+    print(
+        f"Still running after {timeout:g}s. It may be draining a request; "
+        f"send SIGKILL with 'kill -9 {pid}' if you need it gone now.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def status() -> int:
+    pid = _read_pid()
+    if pid is None:
+        print("OpenStack-Simulator is not running.")
+        return 1
+    print(f"OpenStack-Simulator is running (pid {pid}):")
+    for name, port in PORTS.items():
+        print(f"    {name:<11} http://{settings.advertise_host}:{port}")
+    return 0
+
+
 def _banner(host: str) -> str:
     lines = ["", "  OpenStack-Simulator is up", ""]
     width = max(len(name) for name in PORTS)
@@ -141,10 +232,12 @@ async def serve(log_level: str = "info", access_log: bool = False) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _shutdown)
 
+    _write_pid()
     print(_banner(settings.advertise_host), flush=True)
     try:
         await asyncio.gather(*(server.serve() for server in servers))
     finally:
+        _clear_pid()
         await dispose_db()
 
 
@@ -165,7 +258,27 @@ def main(argv: list[str] | None = None) -> int:
         choices=sorted(PORTS),
         help="run only the named service(s) instead of all of them",
     )
+    parser.add_argument(
+        "--stop", action="store_true", help="shut down a detached run and exit"
+    )
+    parser.add_argument(
+        "--status", action="store_true", help="report whether the simulator is running"
+    )
     args = parser.parse_args(argv)
+
+    if args.stop:
+        return stop()
+    if args.status:
+        return status()
+
+    running = _read_pid()
+    if running is not None:
+        print(
+            f"OpenStack-Simulator is already running (pid {running}).\n"
+            f"Stop it first:  python main.py --stop",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.service:
         for name in list(PORTS):

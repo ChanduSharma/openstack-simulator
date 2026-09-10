@@ -222,3 +222,4 @@ __marimo__/
 openstack_simulator.db
 openstack_simulator.db-shm
 openstack_simulator.db-wal
+openstack-simulator.pid
