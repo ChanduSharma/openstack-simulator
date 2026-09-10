@@ -223,7 +223,7 @@ def auth_dependency(service: str) -> Callable[[Request], Awaitable[AuthContext]]
 
 
 async def _anonymous_context() -> AuthContext:
-    """Fallback identity used when OSSIM_REQUIRE_AUTH=0 (handy for curl-driven demos)."""
+    """Fallback identity used when OPENSTACK_SIMULATOR_REQUIRE_AUTH=0 (handy for curl-driven demos)."""
     async with SessionLocal() as session:
         project = (
             await session.execute(
@@ -363,7 +363,7 @@ def _fail_response(
     response = JSONResponse(
         error_body(service, status, message, **extra), status_code=status
     )
-    response.headers["X-OpenStack-Sim-Injected"] = "true"
+    response.headers["X-OpenStack-Simulator-Injected"] = "true"
     for key, value in (headers or {}).items():
         response.headers[key] = value
     return response

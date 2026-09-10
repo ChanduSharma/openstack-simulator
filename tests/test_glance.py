@@ -60,7 +60,7 @@ async def test_upload_is_discarded_but_measured(api) -> None:
     payload = b"\xde\xad\xbe\xef" * 262144          # 1 MiB
     response = await api["glance"].put(f"/v2/images/{image['id']}/file", content=payload)
     assert response.status_code == 204
-    assert response.headers["x-openstack-sim-discarded-bytes"] == str(len(payload))
+    assert response.headers["x-openstack-simulator-discarded-bytes"] == str(len(payload))
 
     body = (await api["glance"].get(f"/v2/images/{image['id']}")).json()
     assert body["status"] == "active"
@@ -90,7 +90,7 @@ async def test_download_returns_no_content(api) -> None:
     await api["glance"].put(f"/v2/images/{image['id']}/file", content=b"payload")
     response = await api["glance"].get(f"/v2/images/{image['id']}/file")
     assert response.status_code == 204
-    assert response.headers["x-openstack-sim-zero-storage"] == "true"
+    assert response.headers["x-openstack-simulator-zero-storage"] == "true"
     assert response.content == b""
 
 

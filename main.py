@@ -1,4 +1,4 @@
-"""OpenStack-Sim entry point.
+"""OpenStack-Simulator entry point.
 
 Every simulated service gets its own native OpenStack port, but they all share one
 process and one asyncio event loop -- so the whole cloud costs a single Python
@@ -81,7 +81,7 @@ def build_apps() -> dict[str, ASGIApp]:
     scenarios_app.include_router(scenarios.router)
     apps["scenarios"] = scenarios_app
 
-    dashboard_app = create_service_app("dashboard", "OpenStack-Sim status dashboard")
+    dashboard_app = create_service_app("dashboard", "OpenStack-Simulator status dashboard")
     dashboard_app.include_router(dashboard.router)
     apps["dashboard"] = dashboard_app
 
@@ -96,14 +96,14 @@ class _Server(uvicorn.Server):
 
 
 def _banner(host: str) -> str:
-    lines = ["", "  OpenStack-Sim is up", ""]
+    lines = ["", "  OpenStack-Simulator is up", ""]
     width = max(len(name) for name in PORTS)
     for name, port in PORTS.items():
         lines.append(f"    {name.ljust(width)}  http://{host}:{port}")
     lines += [
         "",
         f"    dashboard   http://{settings.advertise_host}:{PORTS['dashboard']}/",
-        "    credentials  source openrc.sh   (or: openstack --os-cloud openstack-sim ...)",
+        "    credentials  source openrc.sh   (or: openstack --os-cloud openstack-simulator ...)",
         "",
     ]
     return "\n".join(lines)
@@ -149,7 +149,7 @@ async def serve(log_level: str = "info", access_log: bool = False) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the OpenStack-Sim service suite.")
+    parser = argparse.ArgumentParser(description="Run the OpenStack-Simulator service suite.")
     parser.add_argument(
         "--log-level",
         default="warning",

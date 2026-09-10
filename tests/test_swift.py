@@ -61,7 +61,7 @@ async def test_object_upload_is_discarded_but_hashed(api, account) -> None:
                                       headers={"Content-Type": "application/octet-stream"})
     assert response.status_code == 201
     assert response.headers["etag"] == hashlib.md5(payload).hexdigest()
-    assert response.headers["x-openstack-sim-discarded-bytes"] == str(len(payload))
+    assert response.headers["x-openstack-simulator-discarded-bytes"] == str(len(payload))
 
 
 async def test_object_head_reports_the_original_size(api, account) -> None:
@@ -85,7 +85,7 @@ async def test_object_get_returns_metadata_without_a_body(api, account) -> None:
     assert response.status_code == 200
     assert response.content == b"", "the bytes were never stored"
     assert response.headers["x-object-sim-original-length"] == str(len(payload))
-    assert response.headers["x-openstack-sim-zero-storage"] == "true"
+    assert response.headers["x-openstack-simulator-zero-storage"] == "true"
 
 
 async def test_etag_mismatch_is_rejected(api, account) -> None:

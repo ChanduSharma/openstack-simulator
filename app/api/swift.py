@@ -416,7 +416,7 @@ async def put_object(
             "ETag": etag,
             "Content-Length": "0",
             "Last-Modified": _http_date(obj.last_modified),
-            "X-OpenStack-Sim-Discarded-Bytes": str(total),
+            "X-OpenStack-Simulator-Discarded-Bytes": str(total),
         },
     )
 
@@ -467,7 +467,7 @@ async def get_object(
     headers = _object_headers(obj)
     headers["Content-Length"] = "0"
     headers["X-Object-Sim-Original-Length"] = str(obj.bytes)
-    headers["X-OpenStack-Sim-Zero-Storage"] = "true"
+    headers["X-OpenStack-Simulator-Zero-Storage"] = "true"
     return Response(status_code=200, content=b"", headers=headers)
 
 

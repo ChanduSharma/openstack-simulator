@@ -1,4 +1,4 @@
-# OpenStack-Sim
+# OpenStack-Simulator
 
 A bare-metal-emulating OpenStack API simulator: eleven services on their native ports,
 one Python process, no hypervisor. It models **resource depletion and control-plane
@@ -93,14 +93,14 @@ and `probability`. Rules take effect within a second and expire on their own.
 
 ## Configuration
 
-Every knob is an `OSSIM_*` environment variable — see `app/core/config.py`. Useful ones:
+Every knob is an `OPENSTACK_SIMULATOR_*` environment variable — see `app/core/config.py`. Useful ones:
 
 ```bash
-OSSIM_CPU_ALLOCATION_RATIO=16.0   # more aggressive overcommit
-OSSIM_TRANSITION_MIN=1            # fast transitions for CI
-OSSIM_TRANSITION_MAX=3
-OSSIM_HOST_RAM_MB=8192            # emulate a smaller node
-OSSIM_REQUIRE_AUTH=0              # skip tokens for curl-driven demos
+OPENSTACK_SIMULATOR_CPU_ALLOCATION_RATIO=16.0   # more aggressive overcommit
+OPENSTACK_SIMULATOR_TRANSITION_MIN=1            # fast transitions for CI
+OPENSTACK_SIMULATOR_TRANSITION_MAX=3
+OPENSTACK_SIMULATOR_HOST_RAM_MB=8192            # emulate a smaller node
+OPENSTACK_SIMULATOR_REQUIRE_AUTH=0              # skip tokens for curl-driven demos
 ```
 
 `python main.py --service nova --service keystone` runs a subset.

@@ -144,7 +144,7 @@ def console_output(
     lines.append("SeaBIOS (version 1.16.2-debian-1.16.2-1)")
     lines.append("Booting from Hard Disk...")
     lines.append("")
-    kernel("Linux version 6.8.0-45-generic (buildd@openstack-sim) #45-Ubuntu SMP")
+    kernel("Linux version 6.8.0-45-generic (buildd@openstack-simulator) #45-Ubuntu SMP")
     kernel("Command line: root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0")
     kernel(f"Memory: {ram_kb}K/{ram_kb}K available")
     kernel(f"smpboot: Allowing {server.allocated_vcpus or flavor.vcpus} CPUs")

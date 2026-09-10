@@ -768,7 +768,7 @@ async def get_pools(
                     "allocated_capacity_gb": usage.disk_used_volumes_gb,
                     "volume_backend_name": "LVM_iSCSI",
                     "storage_protocol": "iSCSI",
-                    "vendor_name": "OpenStack-Sim",
+                    "vendor_name": "OpenStack-Simulator",
                     "driver_version": "1.0.0",
                     "timestamp": iso_us(now_utc()),
                 },

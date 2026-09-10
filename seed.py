@@ -132,7 +132,7 @@ async def seed_identity(session: AsyncSession) -> tuple[Project, User]:
             id=deterministic_id(f"user-{settings.admin_user}"),
             name=settings.admin_user,
             password=settings.admin_password,
-            email=f"{settings.admin_user}@openstack-sim.local",
+            email=f"{settings.admin_user}@openstack-simulator.local",
             domain_id=DOMAIN_ID,
             default_project_id=project.id,
             description="Bootstrap administrator",
@@ -332,7 +332,7 @@ async def seed(reset: bool = False) -> None:
         await seed_security_group(session, project.id)
         await session.commit()
 
-        print("Seeded OpenStack-Sim")
+        print("Seeded OpenStack-Simulator")
         print(f"  node          {host.hostname}: {host.sockets} sockets / {host.cores} cores / "
               f"{host.threads} threads")
         print(f"                {host.memory_mb} MB RAM, {host.local_gb} GB disk, "
@@ -350,7 +350,7 @@ async def seed(reset: bool = False) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Seed the OpenStack-Sim database.")
+    parser = argparse.ArgumentParser(description="Seed the OpenStack-Simulator database.")
     parser.add_argument(
         "--reset", action="store_true", help="drop every table before seeding"
     )

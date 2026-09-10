@@ -218,7 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 
-# OpenStack-Sim runtime state
-openstack_sim.db
-openstack_sim.db-shm
-openstack_sim.db-wal
+# OpenStack-Simulator runtime state
+openstack_simulator.db
+openstack_simulator.db-shm
+openstack_simulator.db-wal

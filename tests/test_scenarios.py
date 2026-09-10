@@ -42,7 +42,7 @@ async def test_500_is_injected_in_the_targets_dialect(api) -> None:
     response = await api["nova"].get("/v2.1/servers")
     assert response.status_code == 500
     assert response.json()["computeFault"]["code"] == 500
-    assert response.headers["x-openstack-sim-injected"] == "true"
+    assert response.headers["x-openstack-simulator-injected"] == "true"
 
 
 async def test_injection_is_scoped_to_one_service(api) -> None:

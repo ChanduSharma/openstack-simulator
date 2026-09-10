@@ -97,7 +97,7 @@ def scenario_dict(rule: FailureInjection) -> dict[str, Any]:
 @router.get("/")
 async def index() -> dict[str, Any]:
     return {
-        "name": "openstack-sim scenarios",
+        "name": "openstack-simulator scenarios",
         "versions": [{"id": "v1", "status": "CURRENT", "links": [{"rel": "self", "href": "/v1"}]}],
     }
 

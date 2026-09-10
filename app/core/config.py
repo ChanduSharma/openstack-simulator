@@ -28,106 +28,106 @@ def _env_int(name: str, default: int) -> int:
 
 
 class Settings(BaseModel):
-    """Runtime knobs. Every field can be overridden with an ``OSSIM_*`` env var."""
+    """Runtime knobs. Every field can be overridden with an ``OPENSTACK_SIMULATOR_*`` env var."""
 
     # -- process / networking ---------------------------------------------------------
-    bind_host: str = Field(default_factory=lambda: _env("OSSIM_BIND_HOST", "0.0.0.0"))
+    bind_host: str = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_BIND_HOST", "0.0.0.0"))
     advertise_host: str = Field(
-        default_factory=lambda: _env("OSSIM_ADVERTISE_HOST", "127.0.0.1")
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_ADVERTISE_HOST", "127.0.0.1")
     )
 
     # -- persistence ------------------------------------------------------------------
     database_url: str = Field(
         default_factory=lambda: _env(
-            "OSSIM_DATABASE_URL", "sqlite+aiosqlite:///./openstack_sim.db"
+            "OPENSTACK_SIMULATOR_DATABASE_URL", "sqlite+aiosqlite:///./openstack_simulator.db"
         )
     )
-    sql_echo: bool = Field(default_factory=lambda: _env("OSSIM_SQL_ECHO", "0") == "1")
+    sql_echo: bool = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_SQL_ECHO", "0") == "1")
 
     # -- bare-metal host envelope (node-01) -------------------------------------------
-    host_name: str = Field(default_factory=lambda: _env("OSSIM_HOST_NAME", "node-01"))
-    host_sockets: int = Field(default_factory=lambda: _env_int("OSSIM_HOST_SOCKETS", 2))
-    host_cores: int = Field(default_factory=lambda: _env_int("OSSIM_HOST_CORES", 32))
-    host_threads: int = Field(default_factory=lambda: _env_int("OSSIM_HOST_THREADS", 64))
-    host_ram_mb: int = Field(default_factory=lambda: _env_int("OSSIM_HOST_RAM_MB", 262144))
-    host_disk_gb: int = Field(default_factory=lambda: _env_int("OSSIM_HOST_DISK_GB", 4096))
+    host_name: str = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_HOST_NAME", "node-01"))
+    host_sockets: int = Field(default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_HOST_SOCKETS", 2))
+    host_cores: int = Field(default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_HOST_CORES", 32))
+    host_threads: int = Field(default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_HOST_THREADS", 64))
+    host_ram_mb: int = Field(default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_HOST_RAM_MB", 262144))
+    host_disk_gb: int = Field(default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_HOST_DISK_GB", 4096))
     host_conntrack_max: int = Field(
-        default_factory=lambda: _env_int("OSSIM_CONNTRACK_MAX", 65536)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_CONNTRACK_MAX", 65536)
     )
 
     # -- depletion tuning -------------------------------------------------------------
     cpu_allocation_ratio: float = Field(
-        default_factory=lambda: _env_float("OSSIM_CPU_ALLOCATION_RATIO", 3.0)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_CPU_ALLOCATION_RATIO", 3.0)
     )
     ram_allocation_ratio: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RAM_ALLOCATION_RATIO", 1.0)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RAM_ALLOCATION_RATIO", 1.0)
     )
     disk_allocation_ratio: float = Field(
-        default_factory=lambda: _env_float("OSSIM_DISK_ALLOCATION_RATIO", 1.0)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_DISK_ALLOCATION_RATIO", 1.0)
     )
     # Per-VM QEMU/libvirt process overhead charged on top of the flavor RAM.
     qemu_overhead_mb: int = Field(
-        default_factory=lambda: _env_int("OSSIM_QEMU_OVERHEAD_MB", 256)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_QEMU_OVERHEAD_MB", 256)
     )
     host_reserved_ram_mb: int = Field(
-        default_factory=lambda: _env_int("OSSIM_RESERVED_RAM_MB", 512)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_RESERVED_RAM_MB", 512)
     )
     host_reserved_disk_gb: int = Field(
-        default_factory=lambda: _env_int("OSSIM_RESERVED_DISK_GB", 0)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_RESERVED_DISK_GB", 0)
     )
 
     # -- stateless polling delays -----------------------------------------------------
     transition_min_seconds: int = Field(
-        default_factory=lambda: _env_int("OSSIM_TRANSITION_MIN", 10)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_TRANSITION_MIN", 10)
     )
     transition_max_seconds: int = Field(
-        default_factory=lambda: _env_int("OSSIM_TRANSITION_MAX", 60)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_TRANSITION_MAX", 60)
     )
 
     # -- identity ---------------------------------------------------------------------
-    admin_project: str = Field(default_factory=lambda: _env("OSSIM_ADMIN_PROJECT", "admin"))
-    admin_user: str = Field(default_factory=lambda: _env("OSSIM_ADMIN_USER", "admin"))
-    admin_password: str = Field(default_factory=lambda: _env("OSSIM_ADMIN_PASSWORD", "secret"))
+    admin_project: str = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_ADMIN_PROJECT", "admin"))
+    admin_user: str = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_ADMIN_USER", "admin"))
+    admin_password: str = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_ADMIN_PASSWORD", "secret"))
     token_expiry_hours: int = Field(
-        default_factory=lambda: _env_int("OSSIM_TOKEN_EXPIRY_HOURS", 24)
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_TOKEN_EXPIRY_HOURS", 24)
     )
     require_auth: bool = Field(
-        default_factory=lambda: _env("OSSIM_REQUIRE_AUTH", "1") == "1"
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_REQUIRE_AUTH", "1") == "1"
     )
 
     # -- rating (CloudKitty), unit costs are per hour ----------------------------------
-    rate_vcpu_hour: float = Field(default_factory=lambda: _env_float("OSSIM_RATE_VCPU_HOUR", 0.02))
+    rate_vcpu_hour: float = Field(default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_VCPU_HOUR", 0.02))
     rate_ram_gb_hour: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RATE_RAM_GB_HOUR", 0.01)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_RAM_GB_HOUR", 0.01)
     )
     rate_idle_multiplier: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RATE_IDLE_MULTIPLIER", 0.25)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_IDLE_MULTIPLIER", 0.25)
     )
     rate_volume_gb_hour: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RATE_VOLUME_GB_HOUR", 0.0005)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_VOLUME_GB_HOUR", 0.0005)
     )
     rate_floating_ip_hour: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RATE_FLOATING_IP_HOUR", 0.005)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_FLOATING_IP_HOUR", 0.005)
     )
     rate_object_gb_hour: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RATE_OBJECT_GB_HOUR", 0.0001)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_OBJECT_GB_HOUR", 0.0001)
     )
     rate_loadbalancer_hour: float = Field(
-        default_factory=lambda: _env_float("OSSIM_RATE_LOADBALANCER_HOUR", 0.025)
+        default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_LOADBALANCER_HOUR", 0.025)
     )
 
     # -- networking defaults -----------------------------------------------------------
     external_network_name: str = Field(
-        default_factory=lambda: _env("OSSIM_EXTERNAL_NETWORK", "public")
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_EXTERNAL_NETWORK", "public")
     )
     external_network_cidr: str = Field(
-        default_factory=lambda: _env("OSSIM_EXTERNAL_CIDR", "172.24.4.0/24")
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_EXTERNAL_CIDR", "172.24.4.0/24")
     )
     private_network_name: str = Field(
-        default_factory=lambda: _env("OSSIM_PRIVATE_NETWORK", "private")
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_PRIVATE_NETWORK", "private")
     )
     private_network_cidr: str = Field(
-        default_factory=lambda: _env("OSSIM_PRIVATE_CIDR", "10.0.0.0/24")
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_PRIVATE_CIDR", "10.0.0.0/24")
     )
 
     @property

@@ -17,9 +17,9 @@ from pathlib import Path
 # The app reads its configuration at import time, so the environment must be set first.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("OSSIM_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-os.environ.setdefault("OSSIM_REQUIRE_AUTH", "1")
-os.environ.setdefault("OSSIM_ADVERTISE_HOST", "127.0.0.1")
+os.environ.setdefault("OPENSTACK_SIMULATOR_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("OPENSTACK_SIMULATOR_REQUIRE_AUTH", "1")
+os.environ.setdefault("OPENSTACK_SIMULATOR_ADVERTISE_HOST", "127.0.0.1")
 
 import contextlib  # noqa: E402
 from dataclasses import dataclass  # noqa: E402

@@ -175,7 +175,7 @@ PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenStack-Sim &middot; node status</title>
+<title>OpenStack-Simulator &middot; node status</title>
 <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="h-full bg-slate-950 text-slate-200 font-sans antialiased">
@@ -183,7 +183,7 @@ PAGE = """<!doctype html>
 
   <header class="flex flex-wrap items-baseline justify-between gap-3 border-b border-slate-800 pb-4">
     <div>
-      <h1 class="text-2xl font-semibold text-white">OpenStack-Sim</h1>
+      <h1 class="text-2xl font-semibold text-white">OpenStack-Simulator</h1>
       <p class="text-sm text-slate-400" id="host-line">bare-metal emulation &middot; loading&hellip;</p>
     </div>
     <div class="text-right text-xs text-slate-500">

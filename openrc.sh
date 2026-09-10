@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sourceable credentials for OpenStack-Sim:  source openrc.sh
+# Sourceable credentials for OpenStack-Simulator:  source openrc.sh
 #
 # Works with python-openstackclient, the OpenStack SDK, and the Terraform
 # OpenStack provider (which reads the same OS_* variables).
@@ -27,15 +27,15 @@ export OS_OBJECT_API_VERSION=1
 export OS_RATING_API_VERSION=1
 
 # --- simulator-only endpoints (not part of the Keystone catalog) ----------------------
-export OSSIM_SCENARIOS_URL="${OSSIM_SCENARIOS_URL:-http://127.0.0.1:8999/v1/scenarios}"
-export OSSIM_DASHBOARD_URL="${OSSIM_DASHBOARD_URL:-http://127.0.0.1:10000/}"
+export OPENSTACK_SIMULATOR_SCENARIOS_URL="${OPENSTACK_SIMULATOR_SCENARIOS_URL:-http://127.0.0.1:8999/v1/scenarios}"
+export OPENSTACK_SIMULATOR_DASHBOARD_URL="${OPENSTACK_SIMULATOR_DASHBOARD_URL:-http://127.0.0.1:10000/}"
 
 # Plain HTTP against loopback: no TLS to verify.
 unset OS_CACERT
 export OS_INSECURE=true
 
-echo "OpenStack-Sim credentials loaded:"
+echo "OpenStack-Simulator credentials loaded:"
 echo "  auth url : ${OS_AUTH_URL}"
 echo "  identity : ${OS_USERNAME}@${OS_PROJECT_NAME} (domain ${OS_USER_DOMAIN_NAME})"
-echo "  dashboard: ${OSSIM_DASHBOARD_URL}"
-echo "  scenarios: ${OSSIM_SCENARIOS_URL}"
+echo "  dashboard: ${OPENSTACK_SIMULATOR_DASHBOARD_URL}"
+echo "  scenarios: ${OPENSTACK_SIMULATOR_SCENARIOS_URL}"

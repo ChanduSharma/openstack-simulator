@@ -337,7 +337,7 @@ async def upload_image_data(
         status_code=204,
         headers={
             "Content-Type": "application/json",
-            "X-OpenStack-Sim-Discarded-Bytes": str(total),
+            "X-OpenStack-Simulator-Discarded-Bytes": str(total),
         },
     )
 
@@ -350,7 +350,7 @@ async def download_image_data(
 ) -> Response:
     """No bytes were ever stored, so this is always an empty 204 (a valid Glance reply)."""
     await _get_image(session, image_id)
-    return Response(status_code=204, headers={"X-OpenStack-Sim-Zero-Storage": "true"})
+    return Response(status_code=204, headers={"X-OpenStack-Simulator-Zero-Storage": "true"})
 
 
 # --------------------------------------------------------------------------------------

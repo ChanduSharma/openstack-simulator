@@ -11,7 +11,7 @@ async def test_page_renders(raw_clients) -> None:
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     body = response.text
-    assert "OpenStack-Sim" in body
+    assert "OpenStack-Simulator" in body
     assert "tailwindcss" in body, "styled via the Tailwind CDN"
     assert "/api/stats" in body, "the page polls the stats endpoint"
 
