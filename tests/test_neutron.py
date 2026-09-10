@@ -1,6 +1,8 @@
 """Neutron Networking v2.0 API tests, including IPAM and conntrack accounting."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.core.database import SessionLocal
@@ -435,3 +437,138 @@ async def test_project_id_filter_narrows_the_listing(api, cloud) -> None:
     assert all(g["project_id"] == cloud.project_id for g in seen)
     assert (await api["neutron"].get(
         "/v2.0/security-groups?project_id=nobody")).json()["security_groups"] == []
+
+
+# --------------------------------------------------------------------------------------
+# Routers
+# --------------------------------------------------------------------------------------
+
+
+async def test_router_crud(api) -> None:
+    created = await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "r1"}})
+    assert created.status_code == 201
+    router = created.json()["router"]
+    assert router["status"] == "ACTIVE"
+    assert router["external_gateway_info"] is None, "no gateway until one is attached"
+
+    assert (await api["neutron"].get(f"/v2.0/routers/{router['id']}")).status_code == 200
+    listed = (await api["neutron"].get("/v2.0/routers?name=r1")).json()["routers"]
+    assert [r["id"] for r in listed] == [router["id"]]
+
+    renamed = await api["neutron"].put(f"/v2.0/routers/{router['id']}",
+                                       json={"router": {"name": "r1-renamed"}})
+    assert renamed.json()["router"]["name"] == "r1-renamed"
+
+    assert (await api["neutron"].delete(f"/v2.0/routers/{router['id']}")).status_code == 204
+    assert (await api["neutron"].get(f"/v2.0/routers/{router['id']}")).status_code == 404
+
+
+async def test_external_gateway_set_and_unset(api) -> None:
+    """`router show` must not mention network_id until a gateway is attached."""
+    public = (await api["neutron"].get("/v2.0/networks?name=public")).json()["networks"][0]
+    router = (await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "gw"}})).json()["router"]
+    assert "network_id" not in json.dumps(router)
+
+    updated = await api["neutron"].put(f"/v2.0/routers/{router['id']}", json={
+        "router": {"external_gateway_info": {"network_id": public["id"]}}})
+    gateway = updated.json()["router"]["external_gateway_info"]
+    assert gateway["network_id"] == public["id"]
+    assert gateway["enable_snat"] is True
+    assert gateway["external_fixed_ips"][0]["ip_address"].startswith("172.24.4.")
+
+    cleared = await api["neutron"].put(f"/v2.0/routers/{router['id']}",
+                                       json={"router": {"external_gateway_info": None}})
+    assert cleared.json()["router"]["external_gateway_info"] is None
+
+
+async def test_gateway_must_be_an_external_network(api) -> None:
+    private = (await api["neutron"].get("/v2.0/networks?name=private")).json()["networks"][0]
+    router = (await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "bad-gw"}})).json()["router"]
+    response = await api["neutron"].put(f"/v2.0/routers/{router['id']}", json={
+        "router": {"external_gateway_info": {"network_id": private["id"]}}})
+    assert response.status_code == 400
+
+
+async def test_router_interface_is_a_router_owned_port(api) -> None:
+    network = (await api["neutron"].post("/v2.0/networks",
+                                         json={"network": {"name": "n"}})).json()["network"]
+    subnet = (await api["neutron"].post("/v2.0/subnets", json={
+        "subnet": {"network_id": network["id"], "cidr": "10.44.0.0/24"}})).json()["subnet"]
+    router = (await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "r"}})).json()["router"]
+
+    added = await api["neutron"].put(f"/v2.0/routers/{router['id']}/add_router_interface",
+                                     json={"subnet_id": subnet["id"]})
+    assert added.status_code == 200
+    assert added.json()["subnet_id"] == subnet["id"]
+
+    # the interface exists as a port the router owns, holding the subnet's gateway IP
+    ports = (await api["neutron"].get(
+        f"/v2.0/ports?device_id={router['id']}")).json()["ports"]
+    assert len(ports) == 1
+    assert ports[0]["device_owner"] == "network:router_interface"
+    assert ports[0]["fixed_ips"][0]["ip_address"] == subnet["gateway_ip"]
+
+    shown = (await api["neutron"].get(f"/v2.0/routers/{router['id']}")).json()["router"]
+    assert shown["interfaces_info"][0]["subnet_id"] == subnet["id"]
+
+    removed = await api["neutron"].put(
+        f"/v2.0/routers/{router['id']}/remove_router_interface",
+        json={"subnet_id": subnet["id"]})
+    assert removed.status_code == 200
+    assert (await api["neutron"].get(
+        f"/v2.0/ports?device_id={router['id']}")).json()["ports"] == []
+
+
+async def test_adding_the_same_subnet_twice_is_a_self_overlap_400(api) -> None:
+    """Neutron rejects a redundant add with a 400 the caller treats as idempotent."""
+    network = (await api["neutron"].post("/v2.0/networks",
+                                         json={"network": {"name": "n"}})).json()["network"]
+    subnet = (await api["neutron"].post("/v2.0/subnets", json={
+        "subnet": {"network_id": network["id"], "cidr": "10.45.0.0/24"}})).json()["subnet"]
+    router = (await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "r"}})).json()["router"]
+    await api["neutron"].put(f"/v2.0/routers/{router['id']}/add_router_interface",
+                             json={"subnet_id": subnet["id"]})
+    again = await api["neutron"].put(f"/v2.0/routers/{router['id']}/add_router_interface",
+                                     json={"subnet_id": subnet["id"]})
+    assert again.status_code == 400
+    assert "overlaps with cidr" in again.json()["NeutronError"]["message"]
+
+
+async def test_router_with_interfaces_cannot_be_deleted(api) -> None:
+    network = (await api["neutron"].get("/v2.0/networks?name=private")).json()["networks"][0]
+    subnet_id = network["subnets"][0]
+    router = (await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "busy"}})).json()["router"]
+    await api["neutron"].put(f"/v2.0/routers/{router['id']}/add_router_interface",
+                             json={"subnet_id": subnet_id})
+    assert (await api["neutron"].delete(f"/v2.0/routers/{router['id']}")).status_code == 409
+
+
+async def test_routers_are_scoped_to_the_project(raw_clients, api) -> None:
+    token = await _second_project(raw_clients, api)
+    await api["neutron"].post("/v2.0/routers", json={"router": {"name": "admin-router"}})
+    seen = (await raw_clients["neutron"].get(
+        "/v2.0/routers", headers={"X-Auth-Token": token})).json()["routers"]
+    assert seen == []
+
+
+async def test_port_list_filters_by_fixed_ip_subnet(api) -> None:
+    """`port list --fixed-ip subnet=<id>` is how the caller checks for an interface."""
+    network = (await api["neutron"].get("/v2.0/networks?name=private")).json()["networks"][0]
+    subnet_id = network["subnets"][0]
+    router = (await api["neutron"].post("/v2.0/routers",
+                                        json={"router": {"name": "r"}})).json()["router"]
+    await api["neutron"].put(f"/v2.0/routers/{router['id']}/add_router_interface",
+                             json={"subnet_id": subnet_id})
+
+    match = await api["neutron"].get(
+        f"/v2.0/ports?device_id={router['id']}&fixed_ips=subnet_id%3D{subnet_id}")
+    assert len(match.json()["ports"]) == 1
+    miss = await api["neutron"].get(
+        f"/v2.0/ports?device_id={router['id']}&fixed_ips=subnet_id%3Dnope")
+    assert miss.json()["ports"] == []

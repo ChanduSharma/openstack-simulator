@@ -161,3 +161,36 @@ class FloatingIP(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     released: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class Router(Base):
+    """A tenant router.
+
+    Interfaces are not stored here: attaching a subnet creates a Port owned by the
+    router (``device_owner='network:router_interface'``), exactly as Neutron does, so
+    ``port list --router`` finds them without a second source of truth.
+    """
+
+    __tablename__ = "routers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
+    admin_state_up: Mapped[bool] = mapped_column(Boolean, default=True)
+    description: Mapped[str] = mapped_column(String(1024), default="")
+
+    # External gateway: null until `router set --external-gateway` is called.
+    external_network_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    external_fixed_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    enable_snat: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    distributed: Mapped[bool] = mapped_column(Boolean, default=False)
+    ha: Mapped[bool] = mapped_column(Boolean, default=False)
+    routes: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    availability_zone_hints: Mapped[list[str]] = mapped_column(JSON, default=list)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    revision_number: Mapped[int] = mapped_column(Integer, default=1)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)

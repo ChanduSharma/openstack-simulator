@@ -17,6 +17,7 @@ from app.models.network import (
     FloatingIP,
     Network,
     Port,
+    Router,
     SecurityGroup,
     SecurityGroupRule,
     Subnet,
@@ -654,6 +655,17 @@ async def list_ports(
         stmt = stmt.where(Port.network_id == params["network_id"])
     if "mac_address" in params:
         stmt = stmt.where(Port.mac_address == params["mac_address"])
+    if "device_owner" in params:
+        stmt = stmt.where(Port.device_owner == params["device_owner"])
+    # `port list --fixed-ip subnet=<id>` arrives as fixed_ips=subnet_id=<id>, and may
+    # repeat for ip-address=<addr>. Anything unrecognised is ignored rather than
+    # silently matching nothing.
+    for spec in params.getlist("fixed_ips"):
+        key, _, value = spec.partition("=")
+        if key == "subnet_id" and value:
+            stmt = stmt.where(Port.subnet_id == value)
+        elif key == "ip_address" and value:
+            stmt = stmt.where(Port.ip_address == value)
     if "name" in params:
         stmt = stmt.where(Port.name == params["name"])
     ports = (await session.execute(stmt.order_by(Port.created_at))).scalars().all()
@@ -1080,3 +1092,308 @@ async def delete_floating_ip(
     fip.updated_at = now_utc()
     await session.commit()
     return Response(status_code=204)
+
+# --------------------------------------------------------------------------------------
+# Routers
+# --------------------------------------------------------------------------------------
+
+ROUTER_INTERFACE_OWNER = "network:router_interface"
+ROUTER_GATEWAY_OWNER = "network:router_gateway"
+
+
+class RouterPayload(OSPayload):
+    name: str = ""
+    admin_state_up: bool = True
+    description: str = ""
+    distributed: bool = False
+    ha: bool = False
+    external_gateway_info: dict[str, Any] | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+def router_dict(router: Router, interfaces: list[Port]) -> dict[str, Any]:
+    gateway: dict[str, Any] | None = None
+    if router.external_network_id:
+        # configureRouter() greps `router show` for "network_id" to decide whether the
+        # gateway is already set, so this key must be absent until one is attached.
+        gateway = {
+            "network_id": router.external_network_id,
+            "enable_snat": router.enable_snat,
+            "external_fixed_ips": (
+                [{"ip_address": router.external_fixed_ip}] if router.external_fixed_ip else []
+            ),
+        }
+    return {
+        "id": router.id,
+        "name": router.name,
+        "status": router.status,
+        "admin_state_up": router.admin_state_up,
+        "project_id": router.project_id,
+        "tenant_id": router.project_id,
+        "description": router.description,
+        "external_gateway_info": gateway,
+        "distributed": router.distributed,
+        "ha": router.ha,
+        "routes": list(router.routes or []),
+        "availability_zones": ["nova"],
+        "availability_zone_hints": list(router.availability_zone_hints or []),
+        "flavor_id": None,
+        "interfaces_info": [
+            {
+                "port_id": port.id,
+                "ip_address": port.ip_address,
+                "subnet_id": port.subnet_id,
+            }
+            for port in interfaces
+        ],
+        "tags": list(router.tags or []),
+        "revision_number": router.revision_number,
+        "created_at": iso_us(router.created_at),
+        "updated_at": iso_us(router.updated_at),
+    }
+
+
+async def _router_ports(session: AsyncSession, router_id: str) -> list[Port]:
+    return list(
+        (
+            await session.execute(
+                select(Port).where(
+                    Port.device_id == router_id,
+                    Port.device_owner == ROUTER_INTERFACE_OWNER,
+                )
+            )
+        ).scalars().all()
+    )
+
+
+async def _get_router(session: AsyncSession, router_id: str, auth: AuthContext) -> Router:
+    router = await session.get(Router, router_id)
+    if router is None:
+        raise fault(SERVICE, 404, f"Router {router_id} could not be found.",
+                    type="RouterNotFound")
+    ensure_visible(router, auth, "Router", router_id)
+    return router
+
+
+async def _set_gateway(
+    session: AsyncSession, router: Router, info: dict[str, Any] | None
+) -> None:
+    """Attach or clear the external gateway, mirroring `router set/unset`."""
+    if not info:
+        router.external_network_id = None
+        router.external_fixed_ip = None
+        return
+    network_id = info.get("network_id")
+    if not network_id:
+        return
+    network = await session.get(Network, network_id)
+    if network is None:
+        raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
+                    type="NetworkNotFound")
+    if not network.external:
+        raise fault(
+            SERVICE,
+            400,
+            f"Network {network_id} is not an external network.",
+            type="BadRequest",
+        )
+    router.external_network_id = network.id
+    router.enable_snat = bool(info.get("enable_snat", True))
+    subnet = (
+        await session.execute(
+            select(Subnet).where(Subnet.network_id == network.id).order_by(Subnet.created_at)
+        )
+    ).scalars().first()
+    if subnet is not None and router.external_fixed_ip is None:
+        try:
+            router.external_fixed_ip = await next_free_ip(session, subnet)
+        except AddressPoolExhausted as exc:
+            raise fault(SERVICE, 409, str(exc), type="IpAddressGenerationFailure")
+
+
+@router.get("/v2.0/routers")
+async def list_routers(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = scope_to_project(select(Router), Router, auth, request)
+    if "name" in request.query_params:
+        stmt = stmt.where(Router.name == request.query_params["name"])
+    routers = (await session.execute(stmt.order_by(Router.created_at))).scalars().all()
+    return {
+        "routers": [
+            router_dict(r, await _router_ports(session, r.id)) for r in routers
+        ]
+    }
+
+
+@router.post("/v2.0/routers", status_code=201)
+async def create_router(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = RouterPayload(**body_object(SERVICE, body, "router"))
+    record = Router(
+        id=gen_id(),
+        name=payload.name or f"router-{gen_id()[:8]}",
+        project_id=auth.project_id,
+        admin_state_up=payload.admin_state_up,
+        description=payload.description,
+        distributed=payload.distributed,
+        ha=payload.ha,
+        tags=payload.tags,
+    )
+    session.add(record)
+    await _set_gateway(session, record, payload.external_gateway_info)
+    await session.commit()
+    return {"router": router_dict(record, [])}
+
+
+@router.get("/v2.0/routers/{router_id}")
+async def get_router(
+    router_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    record = await _get_router(session, router_id, auth)
+    return {"router": router_dict(record, await _router_ports(session, record.id))}
+
+
+@router.put("/v2.0/routers/{router_id}")
+async def update_router(
+    router_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    record = await _get_router(session, router_id, auth)
+    payload = body_object(SERVICE, body, "router")
+    for key, value in payload.items():
+        if key in ("name", "admin_state_up", "description", "routes", "tags"):
+            setattr(record, key, value)
+    if "external_gateway_info" in payload:
+        await _set_gateway(session, record, payload["external_gateway_info"])
+    record.revision_number += 1
+    record.updated_at = now_utc()
+    await session.commit()
+    return {"router": router_dict(record, await _router_ports(session, record.id))}
+
+
+@router.delete("/v2.0/routers/{router_id}", status_code=204)
+async def delete_router(
+    router_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    record = await _get_router(session, router_id, auth)
+    interfaces = await _router_ports(session, record.id)
+    if interfaces:
+        raise fault(
+            SERVICE,
+            409,
+            f"Router {router_id} still has ports; remove its interfaces first.",
+            type="RouterInUse",
+        )
+    await session.delete(record)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.put("/v2.0/routers/{router_id}/add_router_interface")
+async def add_router_interface(
+    router_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Attach a subnet by creating a router-owned port holding its gateway address."""
+    record = await _get_router(session, router_id, auth)
+    subnet_id = body.get("subnet_id")
+    port_id = body.get("port_id")
+    if port_id and not subnet_id:
+        port = await session.get(Port, port_id)
+        if port is None:
+            raise fault(SERVICE, 404, f"Port {port_id} could not be found.",
+                        type="PortNotFound")
+        subnet_id = port.subnet_id
+    if not subnet_id:
+        raise fault(SERVICE, 400, "Either subnet_id or port_id must be specified.",
+                    type="BadRequest")
+
+    subnet = await session.get(Subnet, subnet_id)
+    if subnet is None:
+        raise fault(SERVICE, 404, f"Subnet {subnet_id} could not be found.",
+                    type="SubnetNotFound")
+
+    existing = [p for p in await _router_ports(session, record.id) if p.subnet_id == subnet.id]
+    if existing:
+        # Neutron rejects a redundant add with a self-overlap 400 rather than a 409.
+        raise fault(
+            SERVICE,
+            400,
+            f"Cidr {subnet.cidr} of subnet {subnet.id} overlaps with cidr "
+            f"{subnet.cidr} of subnet {subnet.id}",
+            type="BadRequest",
+        )
+
+    network = await session.get(Network, subnet.network_id)
+    port = await create_port_record(
+        session,
+        network,
+        record.project_id,
+        device_id=record.id,
+        device_owner=ROUTER_INTERFACE_OWNER,
+        name=f"router-if-{subnet.name}",
+        fixed_ip=subnet.gateway_ip,
+    )
+    await session.flush()
+    record.updated_at = now_utc()
+    await session.commit()
+    return {
+        "id": record.id,
+        "tenant_id": record.project_id,
+        "project_id": record.project_id,
+        "port_id": port.id,
+        "subnet_id": subnet.id,
+        "subnet_ids": [subnet.id],
+        "network_id": subnet.network_id,
+    }
+
+
+@router.put("/v2.0/routers/{router_id}/remove_router_interface")
+async def remove_router_interface(
+    router_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    record = await _get_router(session, router_id, auth)
+    subnet_id = body.get("subnet_id")
+    port_id = body.get("port_id")
+    ports = await _router_ports(session, record.id)
+    match = None
+    for port in ports:
+        if (subnet_id and port.subnet_id == subnet_id) or (port_id and port.id == port_id):
+            match = port
+            break
+    if match is None:
+        raise fault(
+            SERVICE,
+            404,
+            f"Router {router_id} has no interface on subnet {subnet_id or port_id}.",
+            type="RouterInterfaceNotFound",
+        )
+    result = {
+        "id": record.id,
+        "tenant_id": record.project_id,
+        "project_id": record.project_id,
+        "port_id": match.id,
+        "subnet_id": match.subnet_id,
+        "subnet_ids": [match.subnet_id],
+    }
+    await session.delete(match)
+    record.updated_at = now_utc()
+    await session.commit()
+    return result

@@ -736,6 +736,95 @@ async def server_ips(
     return {"addresses": _addresses(ports.get(server.id, []), networks)}
 
 
+@router.get("/v2.1/servers/{server_id}/metadata")
+async def get_server_metadata(
+    server_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    server = await _get_server(session, server_id)
+    await session.commit()
+    return {"metadata": dict(server.metadata_ or {})}
+
+
+@router.put("/v2.1/servers/{server_id}/metadata")
+async def replace_server_metadata(
+    server_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    server = await _get_server(session, server_id)
+    server.metadata_ = dict(body.get("metadata") or {})
+    server.updated_at = now_utc()
+    await session.commit()
+    return {"metadata": dict(server.metadata_)}
+
+
+@router.post("/v2.1/servers/{server_id}/metadata")
+async def merge_server_metadata(
+    server_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """POST merges keys; PUT replaces the whole map. `server set --property` uses this."""
+    server = await _get_server(session, server_id)
+    server.metadata_ = {**(server.metadata_ or {}), **(body.get("metadata") or {})}
+    server.updated_at = now_utc()
+    await session.commit()
+    return {"metadata": dict(server.metadata_)}
+
+
+@router.get("/v2.1/servers/{server_id}/metadata/{key}")
+async def get_server_metadata_item(
+    server_id: str,
+    key: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    server = await _get_server(session, server_id)
+    await session.commit()
+    metadata = server.metadata_ or {}
+    if key not in metadata:
+        raise fault(SERVICE, 404, f"Metadata item {key} was not found.")
+    return {"meta": {key: metadata[key]}}
+
+
+@router.put("/v2.1/servers/{server_id}/metadata/{key}")
+async def set_server_metadata_item(
+    server_id: str,
+    key: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    server = await _get_server(session, server_id)
+    value = (body.get("meta") or {}).get(key)
+    server.metadata_ = {**(server.metadata_ or {}), key: value}
+    server.updated_at = now_utc()
+    await session.commit()
+    return {"meta": {key: value}}
+
+
+@router.delete("/v2.1/servers/{server_id}/metadata/{key}", status_code=204)
+async def delete_server_metadata_item(
+    server_id: str,
+    key: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    server = await _get_server(session, server_id)
+    metadata = dict(server.metadata_ or {})
+    if key not in metadata:
+        raise fault(SERVICE, 404, f"Metadata item {key} was not found.")
+    metadata.pop(key)
+    server.metadata_ = metadata
+    server.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=204)
+
+
 @router.get("/v2.1/servers/{server_id}/os-security-groups")
 async def server_security_groups(
     server_id: str,
@@ -933,6 +1022,43 @@ async def server_action(
         return Response(
             status_code=202,
             headers={"Location": service_url("glance", f"/v2/images/{image.id}")},
+        )
+    elif action == "rebuild":
+        spec = argument or {}
+        image_ref = spec.get("imageRef") or spec.get("image_ref")
+        if not image_ref:
+            raise fault(SERVICE, 400, "Missing imageRef attribute in rebuild request.")
+        image = await session.get(Image, image_ref)
+        if image is None or image.deleted:
+            raise fault(SERVICE, 400, f"Image {image_ref} could not be found.")
+        flavor = await session.get(Flavor, server.flavor_id)
+        if flavor is not None and image.min_ram and flavor.ram < image.min_ram:
+            raise fault(
+                SERVICE,
+                400,
+                f"Flavor's memory is too small for requested image. "
+                f"Flavor RAM {flavor.ram}MB < image minimum {image.min_ram}MB.",
+            )
+        server.image_id = image.id
+        if spec.get("name"):
+            server.name = spec["name"]
+        if "metadata" in spec:
+            server.metadata_ = spec["metadata"]
+        # A rebuild reimages in place: the booking is unchanged, but the instance
+        # goes back through BUILD like a fresh boot.
+        _set_state(server, "BUILD", task_state="rebuilding")
+        server.transition_until = transition_deadline()
+        server.transition_target = "ACTIVE"
+        await session.commit()
+        flavors, ports, networks, attachments = await _server_context(session, [server])
+        return JSONResponse(
+            {
+                "server": server_dict(
+                    server, flavors.get(server.flavor_id), ports.get(server.id, []),
+                    networks, attachments.get(server.id, []),
+                )
+            },
+            status_code=202,
         )
     elif action in ("addSecurityGroup", "removeSecurityGroup"):
         name = (argument or {}).get("name")
@@ -1353,6 +1479,103 @@ async def services(
             }
             for index, binary in enumerate(names)
         ]
+    }
+
+
+@router.get("/v2.1/os-quota-sets/{project_id}")
+async def quota_set(
+    project_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Compute quotas. `openstack quota show` reads this alongside Cinder and Neutron."""
+    usage = await get_usage(session)
+    limits: dict[str, Any] = {
+        "cores": int(usage.vcpus_allocatable),
+        "ram": int(usage.ram_allocatable_mb),
+        "instances": -1,
+        "key_pairs": 100,
+        "metadata_items": 128,
+        "server_groups": 10,
+        "server_group_members": 10,
+        "injected_files": 5,
+        "injected_file_content_bytes": 10240,
+        "injected_file_path_bytes": 255,
+        "fixed_ips": -1,
+        "floating_ips": 50,
+        "security_groups": 100,
+        "security_group_rules": usage.conntrack_max,
+    }
+    if request.query_params.get("usage", "").lower() in ("true", "1"):
+        in_use = {
+            "cores": usage.vcpus_used,
+            "ram": usage.ram_used_mb,
+            "instances": usage.total_instances,
+        }
+        body: dict[str, Any] = {
+            key: {"limit": value, "in_use": in_use.get(key, 0), "reserved": 0}
+            for key, value in limits.items()
+        }
+    else:
+        body = dict(limits)
+    body["id"] = project_id
+    return {"quota_set": body}
+
+
+@router.get("/v2.1/os-simple-tenant-usage/{project_id}")
+async def tenant_usage_detail(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Per-project usage, as `openstack usage show` requests it."""
+    servers = (
+        await session.execute(
+            select(Server).where(
+                Server.deleted.is_(False), Server.project_id == project_id
+            )
+        )
+    ).scalars().all()
+    now = now_utc()
+    server_usages = []
+    total_hours = 0.0
+    for server in servers:
+        hours = max((now - server.created_at).total_seconds(), 0) / 3600.0
+        total_hours += hours
+        server_usages.append(
+            {
+                "instance_id": server.id,
+                "name": server.name,
+                "hours": round(hours, 4),
+                "flavor": server.flavor_id,
+                "vcpus": server.allocated_vcpus,
+                "memory_mb": server.allocated_ram_mb,
+                "local_gb": server.allocated_disk_gb,
+                "state": server.status.lower(),
+                "uptime": int((now - server.created_at).total_seconds()),
+                "started_at": iso(server.launched_at or server.created_at),
+                "ended_at": iso(server.terminated_at),
+                "tenant_id": server.project_id,
+            }
+        )
+    return {
+        "tenant_usage": {
+            "tenant_id": project_id,
+            "total_hours": round(total_hours, 4),
+            "total_vcpus_usage": round(
+                sum(s.allocated_vcpus for s in servers) * total_hours, 4
+            ),
+            "total_memory_mb_usage": round(
+                sum(s.allocated_ram_mb for s in servers) * total_hours, 4
+            ),
+            "total_local_gb_usage": round(
+                sum(s.allocated_disk_gb for s in servers) * total_hours, 4
+            ),
+            "server_usages": server_usages,
+            "start": iso(min((s.created_at for s in servers), default=now)),
+            "stop": iso(now),
+        }
     }
 
 

@@ -591,3 +591,103 @@ async def test_detaching_a_group_that_is_not_attached_is_a_400(api) -> None:
     response = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
                                       json={"removeSecurityGroup": {"name": "unused"}})
     assert response.status_code == 400
+
+
+# --------------------------------------------------------------------------------------
+# Rebuild, metadata, quotas, per-project usage
+# --------------------------------------------------------------------------------------
+
+
+async def test_rebuild_reimages_in_place(api) -> None:
+    server_id = await _boot(api, name="rebuildable", flavor="m1.medium", image="cirros")
+    _, images = await _ids(api)
+    before = (await api["nova"].get("/v2.1/os-hypervisors/statistics")).json()["hypervisor_statistics"]
+
+    response = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                      json={"rebuild": {"imageRef": images["ubuntu-24.04"]}})
+    assert response.status_code == 202
+    assert response.json()["server"]["id"] == server_id, "rebuild returns the server body"
+
+    body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+    assert body["image"]["id"] == images["ubuntu-24.04"]
+
+    after = (await api["nova"].get("/v2.1/os-hypervisors/statistics")).json()["hypervisor_statistics"]
+    assert after["vcpus_used"] == before["vcpus_used"], "a rebuild does not re-book capacity"
+    assert after["memory_mb_used"] == before["memory_mb_used"]
+
+
+async def test_rebuild_validates_its_image(api) -> None:
+    server_id = await _boot(api, flavor="m1.tiny")
+    _, images = await _ids(api)
+    assert (await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                   json={"rebuild": {}})).status_code == 400
+    assert (await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                   json={"rebuild": {"imageRef": "ghost"}})).status_code == 400
+    # m1.tiny cannot satisfy ubuntu's 2048 MB minimum
+    too_big = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                     json={"rebuild": {"imageRef": images["ubuntu-24.04"]}})
+    assert too_big.status_code == 400
+
+
+async def test_server_metadata_endpoints(api) -> None:
+    server_id = await _boot(api, metadata={"role": "web"})
+    assert (await api["nova"].get(
+        f"/v2.1/servers/{server_id}/metadata")).json()["metadata"] == {"role": "web"}
+
+    # POST merges (this is what `server set --property` uses)
+    merged = await api["nova"].post(f"/v2.1/servers/{server_id}/metadata",
+                                    json={"metadata": {"tier": "gold"}})
+    assert merged.json()["metadata"] == {"role": "web", "tier": "gold"}
+
+    # PUT replaces wholesale
+    replaced = await api["nova"].put(f"/v2.1/servers/{server_id}/metadata",
+                                     json={"metadata": {"only": "this"}})
+    assert replaced.json()["metadata"] == {"only": "this"}
+
+    single = await api["nova"].put(f"/v2.1/servers/{server_id}/metadata/env",
+                                   json={"meta": {"env": "prod"}})
+    assert single.json() == {"meta": {"env": "prod"}}
+    assert (await api["nova"].get(
+        f"/v2.1/servers/{server_id}/metadata/env")).json() == {"meta": {"env": "prod"}}
+
+    assert (await api["nova"].delete(
+        f"/v2.1/servers/{server_id}/metadata/env")).status_code == 204
+    assert (await api["nova"].get(
+        f"/v2.1/servers/{server_id}/metadata/env")).status_code == 404
+    assert (await api["nova"].delete(
+        f"/v2.1/servers/{server_id}/metadata/env")).status_code == 404
+
+    # metadata shows up on the server itself
+    body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+    assert body["metadata"] == {"only": "this"}
+
+
+async def test_quota_set_endpoint(api, cloud) -> None:
+    await _boot(api, flavor="m1.medium")
+    quota = (await api["nova"].get(
+        f"/v2.1/os-quota-sets/{cloud.project_id}")).json()["quota_set"]
+    assert quota["id"] == cloud.project_id
+    assert quota["cores"] == 192
+    assert quota["ram"] == 261632
+
+    with_usage = (await api["nova"].get(
+        f"/v2.1/os-quota-sets/{cloud.project_id}?usage=True")).json()["quota_set"]
+    assert with_usage["cores"] == {"limit": 192, "in_use": 2, "reserved": 0}
+    assert with_usage["ram"]["in_use"] == 4352
+
+
+async def test_per_project_tenant_usage(api, cloud) -> None:
+    server_id = await _boot(api, name="billed", flavor="m1.medium")
+    usage = (await api["nova"].get(
+        f"/v2.1/os-simple-tenant-usage/{cloud.project_id}")).json()["tenant_usage"]
+    assert usage["tenant_id"] == cloud.project_id
+    assert len(usage["server_usages"]) == 1
+    entry = usage["server_usages"][0]
+    assert entry["instance_id"] == server_id
+    assert entry["name"] == "billed"
+    assert entry["vcpus"] == 2 and entry["memory_mb"] == 4096
+    assert usage["start"] and usage["stop"]
+
+    empty = (await api["nova"].get(
+        "/v2.1/os-simple-tenant-usage/nobody")).json()["tenant_usage"]
+    assert empty["server_usages"] == []
