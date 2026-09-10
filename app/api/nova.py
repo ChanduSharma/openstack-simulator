@@ -121,6 +121,12 @@ def _set_state(server: Server, status: str, task_state: str | None = None) -> No
     server.vm_state = vm_state
     server.power_state = power_state
     server.task_state = task_state
+    # Any explicit state change cancels a pending transition. Without this, stopping
+    # an instance that is still inside its build window leaves the old deadline armed
+    # and the next read resurrects it as ACTIVE. Callers that want a *new* window
+    # (reboot, unshelve) set one immediately after this call.
+    server.transition_until = None
+    server.transition_target = None
     server.updated_at = now_utc()
 
 

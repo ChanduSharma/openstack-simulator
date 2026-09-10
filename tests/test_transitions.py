@@ -253,3 +253,66 @@ async def test_dashboard_reports_pending_deadlines(api, slow_transitions) -> Non
     stats = (await api["dashboard"].get("/api/stats")).json()
     assert stats["servers"][0]["status"] == "BUILD"
     assert stats["servers"][0]["pending_until"] is not None
+
+
+async def test_stopping_during_the_build_window_sticks(api, slow_transitions) -> None:
+    """An explicit action cancels the pending transition instead of being undone by it.
+
+    Without this, stopping an instance that is still inside its 10-60s build window
+    leaves the old deadline armed, and the next read resurrects it as ACTIVE.
+    """
+    from app.core.database import SessionLocal
+
+    server_id = await _boot(api)
+    assert (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]["status"] == "BUILD"
+
+    await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                           json={"os-resetState": {"state": "active"}})
+    await api["nova"].post(f"/v2.1/servers/{server_id}/action", json={"os-stop": None})
+
+    async with SessionLocal() as session:
+        stored = await session.get(Server, server_id)
+    assert stored.status == "SHUTOFF"
+    assert stored.transition_until is None, "the build deadline must have been cancelled"
+    assert stored.transition_target is None
+
+    # Nothing left to fire, so the instance stays stopped however often it is polled.
+    for _ in range(3):
+        body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+        assert body["status"] == "SHUTOFF"
+
+
+async def test_shelve_offload_during_the_build_window_sticks(api, slow_transitions) -> None:
+    from app.core.database import SessionLocal
+
+    server_id = await _boot(api)
+    await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                           json={"os-resetState": {"state": "active"}})
+    await api["nova"].post(f"/v2.1/servers/{server_id}/action", json={"shelveOffload": None})
+
+    async with SessionLocal() as session:
+        stored = await session.get(Server, server_id)
+    assert stored.transition_until is None
+
+    body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+    assert body["status"] == "SHELVED_OFFLOADED"
+    stats = (await api["nova"].get("/v2.1/os-hypervisors/statistics")).json()["hypervisor_statistics"]
+    assert stats["vcpus_used"] == 0, "and its vCPU stays released"
+
+
+async def test_reboot_still_opens_a_fresh_window(api, slow_transitions, expire) -> None:
+    """Cancelling on state change must not break actions that want a new window."""
+    from app.core.database import SessionLocal
+
+    server_id = await _boot(api)
+    await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                           json={"os-resetState": {"state": "active"}})
+    await api["nova"].post(f"/v2.1/servers/{server_id}/action", json={"reboot": {"type": "SOFT"}})
+
+    async with SessionLocal() as session:
+        stored = await session.get(Server, server_id)
+    assert stored.transition_until is not None, "reboot re-arms a deadline of its own"
+    assert (await api["nova"].get(
+        f"/v2.1/servers/{server_id}")).json()["server"]["OS-EXT-STS:task_state"] == "rebooting"
+    await expire(Server, server_id)
+    assert (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]["status"] == "ACTIVE"

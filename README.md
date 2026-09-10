@@ -8,6 +8,10 @@ Terraform provider against a cloud that runs on an old laptop.
 Nothing is virtualised. Booting a `m1.medium` deducts 2 vCPU, 4096 + 256 MB of RAM and
 40 GB of disk from a simulated 256 GB node — but starts no QEMU and allocates no memory.
 
+![The status dashboard on port 10000: live capacity meters for vCPU, RAM, disk and
+conntrack, instances across BUILD / ACTIVE / SHUTOFF / SHELVED_OFFLOADED, attached
+volumes, load balancers and on-the-fly rating](docs/dashboard.png)
+
 ## Quick start
 
 ```bash
@@ -101,6 +105,12 @@ curl -X POST http://127.0.0.1:8999/v1/scenarios \
   -H 'Content-Type: application/json' \
   -d '{"service": "nova", "action": "500_error", "duration_seconds": 30}'
 ```
+
+![The dashboard highlighting two active failure injections, with hit counts and the
+time left on each](docs/dashboard-failure-injection.png)
+
+Active rules surface on the dashboard with a live hit count, so you can see exactly how
+many client calls each one intercepted.
 
 Actions: `500_error`, `503_error`, `rate_limit` (429 + `Retry-After`), `latency`,
 `timeout` (504), `quota_exhausted` (403). Narrow a rule with `path_contains`, `method`
