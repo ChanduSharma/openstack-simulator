@@ -1,0 +1,1140 @@
+"""Neutron Networking v2.0 (port 9696): networks, subnets, ports, security groups,
+floating IPs -- with simulated IPAM and conntrack accounting."""
+from __future__ import annotations
+
+import ipaddress
+import random
+from typing import Any
+
+from fastapi import APIRouter, Depends, Request, Response
+from pydantic import Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import gen_id, iso_us, now_utc, settings
+from app.core.database import get_session
+from app.core.middleware import AuthContext, OSPayload, fault, require
+from app.models.network import (
+    FloatingIP,
+    Network,
+    Port,
+    SecurityGroup,
+    SecurityGroupRule,
+    Subnet,
+)
+from app.services.capacity import CapacityError, check_conntrack_capacity
+
+SERVICE = "neutron"
+router = APIRouter()
+auth_dep = require(SERVICE)
+
+
+# --------------------------------------------------------------------------------------
+# Simulated IPAM / MAC allocation -- reused by Nova and Octavia
+# --------------------------------------------------------------------------------------
+
+
+def gen_mac() -> str:
+    return "fa:16:3e:%02x:%02x:%02x" % (
+        random.randint(0, 255),
+        random.randint(0, 255),
+        random.randint(0, 255),
+    )
+
+
+def allocation_pool(cidr: str) -> tuple[str, str, str]:
+    """(gateway, pool_start, pool_end) using the usual OpenStack convention."""
+    net = ipaddress.ip_network(cidr, strict=False)
+    hosts = list(net.hosts()) if net.num_addresses <= 65536 else None
+    if hosts:
+        gateway = str(hosts[0])
+        # The gateway is never handed out, so the pool starts one past it unless the
+        # network is so small that the gateway is the only address there is.
+        start = str(hosts[1]) if len(hosts) > 1 else str(hosts[0])
+        end = str(hosts[-1])
+    else:  # very large network: derive arithmetically instead of materialising hosts
+        base = int(net.network_address)
+        gateway = str(ipaddress.ip_address(base + 1))
+        start = str(ipaddress.ip_address(base + 2))
+        end = str(ipaddress.ip_address(int(net.broadcast_address) - 1))
+    return gateway, start, end
+
+
+async def next_free_ip(session: AsyncSession, subnet: Subnet) -> str:
+    """Hand out the next address from the pool, skipping anything already bound."""
+    start = int(ipaddress.ip_address(subnet.allocation_start))
+    end = int(ipaddress.ip_address(subnet.allocation_end))
+    taken = set(
+        (
+            await session.execute(
+                select(Port.ip_address).where(Port.subnet_id == subnet.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    taken |= set(
+        (
+            await session.execute(
+                select(FloatingIP.floating_ip_address).where(
+                    FloatingIP.released.is_(False)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    candidate = start + subnet.next_ip_offset
+    while candidate <= end:
+        address = str(ipaddress.ip_address(candidate))
+        if address not in taken:
+            subnet.next_ip_offset = candidate - start + 1
+            return address
+        candidate += 1
+    raise fault(
+        SERVICE,
+        409,
+        f"No more IP addresses available on subnet {subnet.id}.",
+        type="IpAddressGenerationFailure",
+    )
+
+
+async def pick_network(
+    session: AsyncSession, project_id: str, network_id: str | None = None
+) -> Network | None:
+    """Resolve an explicit network id, else the project's first internal network."""
+    if network_id:
+        return await session.get(Network, network_id)
+    stmt = (
+        select(Network)
+        .where(Network.external.is_(False))
+        .where((Network.project_id == project_id) | (Network.shared.is_(True)))
+        .order_by(Network.created_at)
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def create_port_record(
+    session: AsyncSession,
+    network: Network,
+    project_id: str,
+    device_id: str = "",
+    device_owner: str = "",
+    name: str = "",
+    security_group_ids: list[str] | None = None,
+    fixed_ip: str | None = None,
+) -> Port:
+    """Create a port on the network's first subnet with an allocated IP + MAC."""
+    subnet = (
+        await session.execute(
+            select(Subnet).where(Subnet.network_id == network.id).order_by(Subnet.created_at)
+        )
+    ).scalars().first()
+    ip_address = fixed_ip
+    if subnet is not None and ip_address is None:
+        ip_address = await next_free_ip(session, subnet)
+    port = Port(
+        id=gen_id(),
+        name=name,
+        network_id=network.id,
+        subnet_id=subnet.id if subnet else None,
+        project_id=project_id,
+        mac_address=gen_mac(),
+        ip_address=ip_address,
+        device_id=device_id,
+        device_owner=device_owner,
+        security_group_ids=security_group_ids or [],
+        status="ACTIVE" if device_id else "DOWN",
+    )
+    session.add(port)
+    return port
+
+
+# --------------------------------------------------------------------------------------
+# Schemas
+# --------------------------------------------------------------------------------------
+
+
+class NetworkPayload(OSPayload):
+    name: str = ""
+    admin_state_up: bool = True
+    shared: bool = False
+    external: bool = Field(default=False, alias="router:external")
+    mtu: int = 1450
+    port_security_enabled: bool = True
+    description: str = ""
+    tenant_id: str | None = None
+    project_id: str | None = None
+
+
+class SubnetPayload(OSPayload):
+    network_id: str
+    cidr: str | None = None
+    name: str = ""
+    ip_version: int = 4
+    gateway_ip: str | None = None
+    enable_dhcp: bool = True
+    dns_nameservers: list[str] = Field(default_factory=list)
+    host_routes: list[dict[str, Any]] = Field(default_factory=list)
+    allocation_pools: list[dict[str, str]] = Field(default_factory=list)
+    description: str = ""
+
+
+class PortPayload(OSPayload):
+    network_id: str
+    name: str = ""
+    admin_state_up: bool = True
+    device_id: str = ""
+    device_owner: str = ""
+    fixed_ips: list[dict[str, Any]] = Field(default_factory=list)
+    security_groups: list[str] = Field(default_factory=list)
+    description: str = ""
+
+
+class SecurityGroupPayload(OSPayload):
+    name: str
+    description: str = ""
+    stateful: bool = True
+
+
+class SecurityGroupRulePayload(OSPayload):
+    security_group_id: str
+    direction: str = "ingress"
+    ethertype: str = "IPv4"
+    protocol: str | None = None
+    port_range_min: int | None = None
+    port_range_max: int | None = None
+    remote_ip_prefix: str | None = None
+    remote_group_id: str | None = None
+    description: str = ""
+
+
+class FloatingIPPayload(OSPayload):
+    floating_network_id: str
+    port_id: str | None = None
+    fixed_ip_address: str | None = None
+    floating_ip_address: str | None = None
+    description: str = ""
+
+
+# --------------------------------------------------------------------------------------
+# Serialisers
+# --------------------------------------------------------------------------------------
+
+
+def network_dict(network: Network, subnet_ids: list[str]) -> dict[str, Any]:
+    return {
+        "id": network.id,
+        "name": network.name,
+        "status": network.status,
+        "admin_state_up": network.admin_state_up,
+        "shared": network.shared,
+        "router:external": network.external,
+        "is_default": False,
+        "mtu": network.mtu,
+        "port_security_enabled": network.port_security_enabled,
+        "provider:network_type": network.provider_network_type,
+        "provider:physical_network": network.provider_physical_network,
+        "provider:segmentation_id": network.provider_segmentation_id,
+        "subnets": subnet_ids,
+        "project_id": network.project_id,
+        "tenant_id": network.project_id,
+        "availability_zones": ["nova"],
+        "availability_zone_hints": list(network.availability_zone_hints or []),
+        "description": network.description,
+        "tags": list(network.tags or []),
+        "revision_number": network.revision_number,
+        "ipv4_address_scope": None,
+        "ipv6_address_scope": None,
+        "l2_adjacency": True,
+        "qos_policy_id": None,
+        "created_at": iso_us(network.created_at),
+        "updated_at": iso_us(network.updated_at),
+    }
+
+
+def subnet_dict(subnet: Subnet) -> dict[str, Any]:
+    return {
+        "id": subnet.id,
+        "name": subnet.name,
+        "network_id": subnet.network_id,
+        "project_id": subnet.project_id,
+        "tenant_id": subnet.project_id,
+        "cidr": subnet.cidr,
+        "ip_version": subnet.ip_version,
+        "gateway_ip": subnet.gateway_ip,
+        "enable_dhcp": subnet.enable_dhcp,
+        "allocation_pools": [
+            {"start": subnet.allocation_start, "end": subnet.allocation_end}
+        ],
+        "dns_nameservers": list(subnet.dns_nameservers or []),
+        "host_routes": list(subnet.host_routes or []),
+        "ipv6_address_mode": None,
+        "ipv6_ra_mode": None,
+        "subnetpool_id": None,
+        "service_types": [],
+        "description": subnet.description,
+        "tags": list(subnet.tags or []),
+        "revision_number": subnet.revision_number,
+        "created_at": iso_us(subnet.created_at),
+        "updated_at": iso_us(subnet.updated_at),
+    }
+
+
+def port_dict(port: Port) -> dict[str, Any]:
+    fixed_ips = (
+        [{"subnet_id": port.subnet_id, "ip_address": port.ip_address}]
+        if port.ip_address
+        else []
+    )
+    return {
+        "id": port.id,
+        "name": port.name,
+        "network_id": port.network_id,
+        "project_id": port.project_id,
+        "tenant_id": port.project_id,
+        "mac_address": port.mac_address,
+        "fixed_ips": fixed_ips,
+        "status": port.status,
+        "admin_state_up": port.admin_state_up,
+        "device_id": port.device_id,
+        "device_owner": port.device_owner,
+        "security_groups": list(port.security_group_ids or []),
+        "allowed_address_pairs": list(port.allowed_address_pairs or []),
+        "extra_dhcp_opts": [],
+        "binding:vnic_type": port.binding_vnic_type,
+        "binding:host_id": port.binding_host_id,
+        "binding:vif_type": "ovs",
+        "binding:vif_details": {"connectivity": "l2", "port_filter": True},
+        "binding:profile": {},
+        "port_security_enabled": port.port_security_enabled,
+        "qos_policy_id": None,
+        "description": port.description,
+        "tags": list(port.tags or []),
+        "revision_number": port.revision_number,
+        "created_at": iso_us(port.created_at),
+        "updated_at": iso_us(port.updated_at),
+    }
+
+
+def rule_dict(rule: SecurityGroupRule) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "security_group_id": rule.security_group_id,
+        "project_id": rule.project_id,
+        "tenant_id": rule.project_id,
+        "direction": rule.direction,
+        "ethertype": rule.ethertype,
+        "protocol": rule.protocol,
+        "port_range_min": rule.port_range_min,
+        "port_range_max": rule.port_range_max,
+        "remote_ip_prefix": rule.remote_ip_prefix,
+        "remote_group_id": rule.remote_group_id,
+        "remote_address_group_id": None,
+        "description": rule.description,
+        "normalized_cidr": rule.remote_ip_prefix,
+        "revision_number": rule.revision_number,
+        "tags": [],
+        "created_at": iso_us(rule.created_at),
+        "updated_at": iso_us(rule.updated_at),
+    }
+
+
+def security_group_dict(group: SecurityGroup) -> dict[str, Any]:
+    return {
+        "id": group.id,
+        "name": group.name,
+        "description": group.description,
+        "project_id": group.project_id,
+        "tenant_id": group.project_id,
+        "stateful": group.stateful,
+        "shared": False,
+        "security_group_rules": [rule_dict(r) for r in group.rules],
+        "tags": list(group.tags or []),
+        "revision_number": group.revision_number,
+        "created_at": iso_us(group.created_at),
+        "updated_at": iso_us(group.updated_at),
+    }
+
+
+def floating_ip_dict(fip: FloatingIP) -> dict[str, Any]:
+    return {
+        "id": fip.id,
+        "floating_network_id": fip.floating_network_id,
+        "floating_ip_address": fip.floating_ip_address,
+        "fixed_ip_address": fip.fixed_ip_address,
+        "port_id": fip.port_id,
+        "router_id": fip.router_id,
+        "status": fip.status,
+        "project_id": fip.project_id,
+        "tenant_id": fip.project_id,
+        "description": fip.description,
+        "dns_domain": fip.dns_domain,
+        "dns_name": fip.dns_name,
+        "port_details": None,
+        "qos_policy_id": None,
+        "port_forwardings": [],
+        "tags": list(fip.tags or []),
+        "revision_number": fip.revision_number,
+        "created_at": iso_us(fip.created_at),
+        "updated_at": iso_us(fip.updated_at),
+    }
+
+
+def _body(request_body: dict[str, Any], key: str) -> dict[str, Any]:
+    payload = request_body.get(key)
+    if not isinstance(payload, dict):
+        raise fault(SERVICE, 400, f"Request body must contain a '{key}' object.")
+    return payload
+
+
+# --------------------------------------------------------------------------------------
+# Version discovery
+# --------------------------------------------------------------------------------------
+
+
+@router.get("/", include_in_schema=False)
+async def versions() -> dict[str, Any]:
+    return {
+        "versions": [
+            {
+                "id": "v2.0",
+                "status": "CURRENT",
+                "links": [
+                    {
+                        "rel": "self",
+                        "href": f"http://{settings.advertise_host}:9696/v2.0/",
+                    }
+                ],
+            }
+        ]
+    }
+
+
+@router.get("/v2.0", include_in_schema=False)
+@router.get("/v2.0/", include_in_schema=False)
+async def version_v2() -> dict[str, Any]:
+    return {"version": {"id": "v2.0", "status": "CURRENT"}}
+
+
+@router.get("/v2.0/extensions")
+async def extensions(auth: AuthContext = auth_dep) -> dict[str, Any]:
+    names = [
+        ("security-group", "security-group"),
+        ("router", "router"),
+        ("external-net", "external-net"),
+        ("port-security", "port-security"),
+        ("standard-attr-description", "standard-attr-description"),
+        ("standard-attr-tag", "standard-attr-tag"),
+        ("dhcp_agent_scheduler", "dhcp_agent_scheduler"),
+        ("multi-provider", "multi-provider"),
+        ("allowed-address-pairs", "allowed-address-pairs"),
+        ("availability_zone", "availability_zone"),
+        ("subnet_allocation", "subnet_allocation"),
+    ]
+    return {
+        "extensions": [
+            {
+                "alias": alias,
+                "name": name,
+                "description": f"Simulated {name} extension",
+                "updated": "2024-01-01T00:00:00Z",
+                "links": [],
+            }
+            for alias, name in names
+        ]
+    }
+
+
+@router.get("/v2.0/availability_zones")
+async def availability_zones(auth: AuthContext = auth_dep) -> dict[str, Any]:
+    return {
+        "availability_zones": [
+            {"state": "available", "resource": "network", "name": "nova"},
+            {"state": "available", "resource": "router", "name": "nova"},
+        ]
+    }
+
+
+@router.get("/v2.0/quotas/{project_id}")
+async def quotas(project_id: str, auth: AuthContext = auth_dep) -> dict[str, Any]:
+    return {
+        "quota": {
+            "floatingip": 50,
+            "network": 100,
+            "port": 500,
+            "rbac_policy": 10,
+            "router": 10,
+            "security_group": 100,
+            "security_group_rule": settings.host_conntrack_max,
+            "subnet": 100,
+            "subnetpool": -1,
+        }
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Networks
+# --------------------------------------------------------------------------------------
+
+
+async def _subnet_ids(session: AsyncSession, network_id: str) -> list[str]:
+    return list(
+        (
+            await session.execute(select(Subnet.id).where(Subnet.network_id == network_id))
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.get("/v2.0/networks")
+async def list_networks(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(Network)
+    params = request.query_params
+    if "name" in params:
+        stmt = stmt.where(Network.name == params["name"])
+    if "id" in params:
+        stmt = stmt.where(Network.id == params["id"])
+    if "router:external" in params:
+        stmt = stmt.where(Network.external.is_(params["router:external"].lower() == "true"))
+    networks = (await session.execute(stmt.order_by(Network.created_at))).scalars().all()
+    return {
+        "networks": [
+            network_dict(n, await _subnet_ids(session, n.id)) for n in networks
+        ]
+    }
+
+
+@router.post("/v2.0/networks", status_code=201)
+async def create_network(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = NetworkPayload(**_body(body, "network"))
+    network = Network(
+        id=gen_id(),
+        name=payload.name or f"net-{gen_id()[:8]}",
+        project_id=payload.project_id or payload.tenant_id or auth.project_id,
+        admin_state_up=payload.admin_state_up,
+        shared=payload.shared,
+        external=payload.external,
+        mtu=payload.mtu,
+        port_security_enabled=payload.port_security_enabled,
+        description=payload.description,
+        provider_segmentation_id=random.randint(1, 4095),
+    )
+    session.add(network)
+    await session.commit()
+    return {"network": network_dict(network, [])}
+
+
+@router.get("/v2.0/networks/{network_id}")
+async def get_network(
+    network_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    network = await session.get(Network, network_id)
+    if network is None:
+        raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
+                    type="NetworkNotFound")
+    return {"network": network_dict(network, await _subnet_ids(session, network.id))}
+
+
+@router.put("/v2.0/networks/{network_id}")
+async def update_network(
+    network_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    network = await session.get(Network, network_id)
+    if network is None:
+        raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
+                    type="NetworkNotFound")
+    for key, value in _body(body, "network").items():
+        if key in ("name", "admin_state_up", "shared", "description", "mtu", "tags"):
+            setattr(network, key, value)
+    network.revision_number += 1
+    network.updated_at = now_utc()
+    await session.commit()
+    return {"network": network_dict(network, await _subnet_ids(session, network.id))}
+
+
+@router.delete("/v2.0/networks/{network_id}", status_code=204)
+async def delete_network(
+    network_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    network = await session.get(Network, network_id)
+    if network is None:
+        raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
+                    type="NetworkNotFound")
+    in_use = (
+        await session.execute(
+            select(Port).where(Port.network_id == network_id, Port.device_id != "")
+        )
+    ).scalars().first()
+    if in_use is not None:
+        raise fault(
+            SERVICE,
+            409,
+            f"Unable to complete operation on network {network_id}. "
+            "There are one or more ports still in use.",
+            type="NetworkInUse",
+        )
+    await session.delete(network)  # subnets and unbound ports cascade
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Subnets
+# --------------------------------------------------------------------------------------
+
+
+@router.get("/v2.0/subnets")
+async def list_subnets(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(Subnet)
+    if "network_id" in request.query_params:
+        stmt = stmt.where(Subnet.network_id == request.query_params["network_id"])
+    if "name" in request.query_params:
+        stmt = stmt.where(Subnet.name == request.query_params["name"])
+    subnets = (await session.execute(stmt.order_by(Subnet.created_at))).scalars().all()
+    return {"subnets": [subnet_dict(s) for s in subnets]}
+
+
+@router.post("/v2.0/subnets", status_code=201)
+async def create_subnet(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = SubnetPayload(**_body(body, "subnet"))
+    network = await session.get(Network, payload.network_id)
+    if network is None:
+        raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
+                    type="NetworkNotFound")
+    if not payload.cidr:
+        raise fault(SERVICE, 400, "A cidr must be supplied.", type="BadRequest")
+    try:
+        gateway, start, end = allocation_pool(payload.cidr)
+    except ValueError as exc:
+        raise fault(SERVICE, 400, f"Invalid CIDR {payload.cidr}: {exc}", type="BadRequest")
+    if payload.allocation_pools:
+        start = payload.allocation_pools[0].get("start", start)
+        end = payload.allocation_pools[0].get("end", end)
+
+    subnet = Subnet(
+        id=gen_id(),
+        name=payload.name or f"subnet-{gen_id()[:8]}",
+        network_id=network.id,
+        project_id=auth.project_id,
+        cidr=payload.cidr,
+        ip_version=payload.ip_version,
+        gateway_ip=payload.gateway_ip or gateway,
+        enable_dhcp=payload.enable_dhcp,
+        allocation_start=start,
+        allocation_end=end,
+        dns_nameservers=payload.dns_nameservers,
+        host_routes=payload.host_routes,
+        description=payload.description,
+    )
+    session.add(subnet)
+    await session.commit()
+    return {"subnet": subnet_dict(subnet)}
+
+
+@router.get("/v2.0/subnets/{subnet_id}")
+async def get_subnet(
+    subnet_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    subnet = await session.get(Subnet, subnet_id)
+    if subnet is None:
+        raise fault(SERVICE, 404, f"Subnet {subnet_id} could not be found.",
+                    type="SubnetNotFound")
+    return {"subnet": subnet_dict(subnet)}
+
+
+@router.put("/v2.0/subnets/{subnet_id}")
+async def update_subnet(
+    subnet_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    subnet = await session.get(Subnet, subnet_id)
+    if subnet is None:
+        raise fault(SERVICE, 404, f"Subnet {subnet_id} could not be found.",
+                    type="SubnetNotFound")
+    for key, value in _body(body, "subnet").items():
+        if key in ("name", "gateway_ip", "enable_dhcp", "dns_nameservers", "description", "tags"):
+            setattr(subnet, key, value)
+    subnet.revision_number += 1
+    subnet.updated_at = now_utc()
+    await session.commit()
+    return {"subnet": subnet_dict(subnet)}
+
+
+@router.delete("/v2.0/subnets/{subnet_id}", status_code=204)
+async def delete_subnet(
+    subnet_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    subnet = await session.get(Subnet, subnet_id)
+    if subnet is None:
+        raise fault(SERVICE, 404, f"Subnet {subnet_id} could not be found.",
+                    type="SubnetNotFound")
+    await session.delete(subnet)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Ports
+# --------------------------------------------------------------------------------------
+
+
+@router.get("/v2.0/ports")
+async def list_ports(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(Port)
+    params = request.query_params
+    if "device_id" in params:
+        stmt = stmt.where(Port.device_id == params["device_id"])
+    if "network_id" in params:
+        stmt = stmt.where(Port.network_id == params["network_id"])
+    if "mac_address" in params:
+        stmt = stmt.where(Port.mac_address == params["mac_address"])
+    if "name" in params:
+        stmt = stmt.where(Port.name == params["name"])
+    ports = (await session.execute(stmt.order_by(Port.created_at))).scalars().all()
+    return {"ports": [port_dict(p) for p in ports]}
+
+
+@router.post("/v2.0/ports", status_code=201)
+async def create_port(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = PortPayload(**_body(body, "port"))
+    network = await session.get(Network, payload.network_id)
+    if network is None:
+        raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
+                    type="NetworkNotFound")
+    fixed_ip = None
+    if payload.fixed_ips:
+        fixed_ip = payload.fixed_ips[0].get("ip_address")
+    port = await create_port_record(
+        session,
+        network,
+        auth.project_id,
+        device_id=payload.device_id,
+        device_owner=payload.device_owner,
+        name=payload.name,
+        security_group_ids=payload.security_groups,
+        fixed_ip=fixed_ip,
+    )
+    port.description = payload.description
+    port.admin_state_up = payload.admin_state_up
+    await session.commit()
+    return {"port": port_dict(port)}
+
+
+@router.get("/v2.0/ports/{port_id}")
+async def get_port(
+    port_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    port = await session.get(Port, port_id)
+    if port is None:
+        raise fault(SERVICE, 404, f"Port {port_id} could not be found.", type="PortNotFound")
+    return {"port": port_dict(port)}
+
+
+@router.put("/v2.0/ports/{port_id}")
+async def update_port(
+    port_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    port = await session.get(Port, port_id)
+    if port is None:
+        raise fault(SERVICE, 404, f"Port {port_id} could not be found.", type="PortNotFound")
+    payload = _body(body, "port")
+    for key, value in payload.items():
+        if key == "security_groups":
+            port.security_group_ids = value
+        elif key in ("name", "admin_state_up", "device_id", "device_owner", "description", "tags"):
+            setattr(port, key, value)
+    port.revision_number += 1
+    port.updated_at = now_utc()
+    await session.commit()
+    return {"port": port_dict(port)}
+
+
+@router.delete("/v2.0/ports/{port_id}", status_code=204)
+async def delete_port(
+    port_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    port = await session.get(Port, port_id)
+    if port is None:
+        raise fault(SERVICE, 404, f"Port {port_id} could not be found.", type="PortNotFound")
+    await session.delete(port)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Security groups -- each rule burns a conntrack slot
+# --------------------------------------------------------------------------------------
+
+
+DEFAULT_EGRESS = (("IPv4", "egress"), ("IPv6", "egress"))
+
+
+@router.get("/v2.0/security-groups")
+async def list_security_groups(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(SecurityGroup)
+    if "name" in request.query_params:
+        stmt = stmt.where(SecurityGroup.name == request.query_params["name"])
+    groups = (await session.execute(stmt.order_by(SecurityGroup.created_at))).scalars().all()
+    return {"security_groups": [security_group_dict(g) for g in groups]}
+
+
+@router.post("/v2.0/security-groups", status_code=201)
+async def create_security_group(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = SecurityGroupPayload(**_body(body, "security_group"))
+    try:
+        await check_conntrack_capacity(session, len(DEFAULT_EGRESS))
+    except CapacityError as exc:
+        raise fault(SERVICE, 409, str(exc), type="SecurityGroupLimitExceeded")
+
+    group = SecurityGroup(
+        id=gen_id(),
+        name=payload.name,
+        description=payload.description or payload.name,
+        project_id=auth.project_id,
+        stateful=payload.stateful,
+    )
+    session.add(group)
+    await session.flush()
+    for ethertype, direction in DEFAULT_EGRESS:
+        session.add(
+            SecurityGroupRule(
+                id=gen_id(),
+                security_group_id=group.id,
+                project_id=auth.project_id,
+                direction=direction,
+                ethertype=ethertype,
+            )
+        )
+    await session.commit()
+    await session.refresh(group)
+    return {"security_group": security_group_dict(group)}
+
+
+@router.get("/v2.0/security-groups/{group_id}")
+async def get_security_group(
+    group_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    group = await session.get(SecurityGroup, group_id)
+    if group is None:
+        raise fault(SERVICE, 404, f"Security group {group_id} does not exist.",
+                    type="SecurityGroupNotFound")
+    return {"security_group": security_group_dict(group)}
+
+
+@router.put("/v2.0/security-groups/{group_id}")
+async def update_security_group(
+    group_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    group = await session.get(SecurityGroup, group_id)
+    if group is None:
+        raise fault(SERVICE, 404, f"Security group {group_id} does not exist.",
+                    type="SecurityGroupNotFound")
+    for key, value in _body(body, "security_group").items():
+        if key in ("name", "description", "tags"):
+            setattr(group, key, value)
+    group.revision_number += 1
+    group.updated_at = now_utc()
+    await session.commit()
+    return {"security_group": security_group_dict(group)}
+
+
+@router.delete("/v2.0/security-groups/{group_id}", status_code=204)
+async def delete_security_group(
+    group_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    group = await session.get(SecurityGroup, group_id)
+    if group is None:
+        raise fault(SERVICE, 404, f"Security group {group_id} does not exist.",
+                    type="SecurityGroupNotFound")
+    await session.delete(group)  # rules cascade, releasing their conntrack slots
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.get("/v2.0/security-group-rules")
+async def list_security_group_rules(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(SecurityGroupRule)
+    if "security_group_id" in request.query_params:
+        stmt = stmt.where(
+            SecurityGroupRule.security_group_id
+            == request.query_params["security_group_id"]
+        )
+    rules = (await session.execute(stmt)).scalars().all()
+    return {"security_group_rules": [rule_dict(r) for r in rules]}
+
+
+@router.post("/v2.0/security-group-rules", status_code=201)
+async def create_security_group_rule(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = SecurityGroupRulePayload(**_body(body, "security_group_rule"))
+    group = await session.get(SecurityGroup, payload.security_group_id)
+    if group is None:
+        raise fault(
+            SERVICE,
+            404,
+            f"Security group {payload.security_group_id} does not exist.",
+            type="SecurityGroupNotFound",
+        )
+    try:
+        await check_conntrack_capacity(session, 1)
+    except CapacityError as exc:
+        raise fault(SERVICE, 409, str(exc), type="SecurityGroupRuleLimitExceeded")
+
+    rule = SecurityGroupRule(
+        id=gen_id(),
+        security_group_id=group.id,
+        project_id=auth.project_id,
+        direction=payload.direction,
+        ethertype=payload.ethertype,
+        protocol=payload.protocol,
+        port_range_min=payload.port_range_min,
+        port_range_max=payload.port_range_max,
+        remote_ip_prefix=payload.remote_ip_prefix,
+        remote_group_id=payload.remote_group_id,
+        description=payload.description,
+    )
+    session.add(rule)
+    await session.commit()
+    return {"security_group_rule": rule_dict(rule)}
+
+
+@router.get("/v2.0/security-group-rules/{rule_id}")
+async def get_security_group_rule(
+    rule_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    rule = await session.get(SecurityGroupRule, rule_id)
+    if rule is None:
+        raise fault(SERVICE, 404, f"Security group rule {rule_id} does not exist.",
+                    type="SecurityGroupRuleNotFound")
+    return {"security_group_rule": rule_dict(rule)}
+
+
+@router.delete("/v2.0/security-group-rules/{rule_id}", status_code=204)
+async def delete_security_group_rule(
+    rule_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    rule = await session.get(SecurityGroupRule, rule_id)
+    if rule is None:
+        raise fault(SERVICE, 404, f"Security group rule {rule_id} does not exist.",
+                    type="SecurityGroupRuleNotFound")
+    await session.delete(rule)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Floating IPs
+# --------------------------------------------------------------------------------------
+
+
+@router.get("/v2.0/floatingips")
+async def list_floating_ips(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(FloatingIP).where(FloatingIP.released.is_(False))
+    params = request.query_params
+    if "port_id" in params:
+        stmt = stmt.where(FloatingIP.port_id == params["port_id"])
+    if "floating_ip_address" in params:
+        stmt = stmt.where(
+            FloatingIP.floating_ip_address == params["floating_ip_address"]
+        )
+    fips = (await session.execute(stmt.order_by(FloatingIP.created_at))).scalars().all()
+    return {"floatingips": [floating_ip_dict(f) for f in fips]}
+
+
+@router.post("/v2.0/floatingips", status_code=201)
+async def create_floating_ip(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = FloatingIPPayload(**_body(body, "floatingip"))
+    network = await session.get(Network, payload.floating_network_id)
+    if network is None:
+        raise fault(
+            SERVICE,
+            404,
+            f"External network {payload.floating_network_id} could not be found.",
+            type="NetworkNotFound",
+        )
+    subnet = (
+        await session.execute(
+            select(Subnet).where(Subnet.network_id == network.id).order_by(Subnet.created_at)
+        )
+    ).scalars().first()
+    if subnet is None:
+        raise fault(
+            SERVICE,
+            400,
+            f"Network {network.id} does not contain any IPv4 subnet.",
+            type="ExternalIpAddressExhausted",
+        )
+    address = payload.floating_ip_address or await next_free_ip(session, subnet)
+
+    fixed_ip = payload.fixed_ip_address
+    status = "DOWN"
+    if payload.port_id:
+        port = await session.get(Port, payload.port_id)
+        if port is None:
+            raise fault(SERVICE, 404, f"Port {payload.port_id} could not be found.",
+                        type="PortNotFound")
+        fixed_ip = fixed_ip or port.ip_address
+        status = "ACTIVE"
+
+    fip = FloatingIP(
+        id=gen_id(),
+        project_id=auth.project_id,
+        floating_network_id=network.id,
+        floating_ip_address=address,
+        fixed_ip_address=fixed_ip,
+        port_id=payload.port_id,
+        status=status,
+        description=payload.description,
+    )
+    session.add(fip)
+    await session.commit()
+    return {"floatingip": floating_ip_dict(fip)}
+
+
+@router.get("/v2.0/floatingips/{fip_id}")
+async def get_floating_ip(
+    fip_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    fip = await session.get(FloatingIP, fip_id)
+    if fip is None or fip.released:
+        raise fault(SERVICE, 404, f"Floating IP {fip_id} could not be found.",
+                    type="FloatingIPNotFound")
+    return {"floatingip": floating_ip_dict(fip)}
+
+
+@router.put("/v2.0/floatingips/{fip_id}")
+async def update_floating_ip(
+    fip_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Associate (port_id set) or disassociate (port_id null) the floating IP."""
+    fip = await session.get(FloatingIP, fip_id)
+    if fip is None or fip.released:
+        raise fault(SERVICE, 404, f"Floating IP {fip_id} could not be found.",
+                    type="FloatingIPNotFound")
+    payload = _body(body, "floatingip")
+    if "port_id" in payload:
+        port_id = payload["port_id"]
+        if port_id:
+            port = await session.get(Port, port_id)
+            if port is None:
+                raise fault(SERVICE, 404, f"Port {port_id} could not be found.",
+                            type="PortNotFound")
+            fip.port_id = port.id
+            fip.fixed_ip_address = payload.get("fixed_ip_address") or port.ip_address
+            fip.status = "ACTIVE"
+        else:
+            fip.port_id = None
+            fip.fixed_ip_address = None
+            fip.status = "DOWN"
+    if "description" in payload:
+        fip.description = payload["description"]
+    fip.revision_number += 1
+    fip.updated_at = now_utc()
+    await session.commit()
+    return {"floatingip": floating_ip_dict(fip)}
+
+
+@router.delete("/v2.0/floatingips/{fip_id}", status_code=204)
+async def delete_floating_ip(
+    fip_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    fip = await session.get(FloatingIP, fip_id)
+    if fip is None or fip.released:
+        raise fault(SERVICE, 404, f"Floating IP {fip_id} could not be found.",
+                    type="FloatingIPNotFound")
+    # Soft release: the address returns to the pool but the row survives for rating.
+    fip.released = True
+    fip.port_id = None
+    fip.fixed_ip_address = None
+    fip.status = "DOWN"
+    fip.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=204)

@@ -1,0 +1,42 @@
+# OpenStack-Sim client configuration.
+#
+#   cp clouds.yaml ~/.config/openstack/clouds.yaml     (or export OS_CLIENT_CONFIG_FILE)
+#   openstack --os-cloud openstack-sim server list
+#
+# The simulator answers on the native OpenStack ports on 127.0.0.1, so the catalog it
+# returns is already correct -- no endpoint overrides are needed.
+clouds:
+  openstack-sim:
+    auth:
+      auth_url: http://127.0.0.1:5000/v3
+      username: admin
+      password: secret
+      project_name: admin
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+    interface: public
+    identity_api_version: 3
+    volume_api_version: 3
+    image_api_version: 2
+    # The simulator issues plain UUID tokens and speaks HTTP only.
+    verify: false
+    # Microversions are echoed back regardless of what is negotiated; pinning the
+    # modern ones keeps the client from probing on every command.
+    compute_api_version: 2.79
+    placement_api_version: 1.36
+    load_balancer_api_version: 2.0
+
+  # Same cloud, addressed as an unscoped admin for cross-project queries.
+  openstack-sim-admin:
+    auth:
+      auth_url: http://127.0.0.1:5000/v3
+      username: admin
+      password: secret
+      project_name: admin
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+    interface: admin
+    identity_api_version: 3
+    volume_api_version: 3
