@@ -430,13 +430,20 @@ def version_headers(service: str) -> dict[str, str]:
 
 def create_service_app(service: str, title: str, description: str = "") -> FastAPI:
     """Build a FastAPI app pre-wired with scenario hooks, version headers and errors."""
+    # Swagger UI at /docs, ReDoc at /redoc, schema at /openapi.json. The schema is built
+    # lazily on first request and then cached, so this costs nothing at startup.
     app = FastAPI(
         title=title,
-        description=description,
+        description=description
+        or (
+            f"{title}\n\nSimulated endpoints — no OpenStack deployment is behind them. "
+            "Request bodies follow the real service's wire format; see "
+            "https://docs.openstack.org/api-ref/ for the authoritative reference."
+        ),
         version="1.0.0",
-        docs_url=None,
-        redoc_url=None,
-        openapi_url=None,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
     )
     app.state.service = service
     static_headers = version_headers(service)

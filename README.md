@@ -62,6 +62,69 @@ Starting a second instance is refused with a clear message instead of eleven
 | Scenarios | 8999 | `/v1/scenarios` | failure injection control plane |
 | Dashboard | 10000 | `/` | live capacity bars, instances, volumes, LBs, billing |
 
+## Using with the OpenStack CLI
+
+Every command below is verified against this simulator with `python-openstackclient`
+10.3.0. The catalog it returns points at the loopback ports, so no endpoint overrides are
+needed.
+
+```bash
+pip install python-openstackclient python-octaviaclient
+source openrc.sh
+
+openstack token issue                       # 32-char UUID token
+openstack catalog list                      # all 10 services
+openstack flavor list
+openstack image list
+
+openstack server create --flavor m1.small --image cirros --network private web-01
+openstack server list                       # BUILD, for a random 10-60s
+openstack console log show web-01           # synthetic cloud-init boot log
+
+# Instances and volumes are not actionable until they leave their transition window,
+# exactly as on a real cloud -- acting too early returns 409, so wait for it:
+until openstack server show web-01 -f value -c status | grep -qx ACTIVE; do sleep 5; done
+
+openstack server stop web-01                # SHUTOFF still holds its cores and RAM
+
+openstack volume create --size 25 data-vol
+until openstack volume show data-vol -f value -c status | grep -qx available; do sleep 5; done
+openstack server add volume web-01 data-vol
+openstack floating ip create public
+openstack security group create web-sg
+
+openstack container create backups
+openstack object create backups ./big.iso   # streamed, hashed, discarded
+
+openstack hypervisor stats show             # watch the node deplete
+openstack loadbalancer list
+```
+
+## API documentation
+
+Each service serves its own interactive docs, because each one is a separate FastAPI app
+on its own port:
+
+| | | |
+|---|---|---|
+| Keystone `:5000/docs` | Nova `:8774/docs` | Cinder `:8776/docs` |
+| Glance `:9292/docs` | Neutron `:9696/docs` | Placement `:8778/docs` |
+| Octavia `:9876/docs` | Swift `:8080/docs` | CloudKitty `:8889/docs` |
+| Scenarios `:8999/docs` | Dashboard `:10000/docs` | |
+
+`/redoc` and `/openapi.json` are served alongside. The schema is generated lazily on first
+request, so it costs nothing at startup.
+
+```bash
+curl -s localhost:8774/openapi.json | jq -r '.paths | keys[]'    # list Nova's paths
+```
+
+Note that most request bodies show as a free-form object rather than a typed schema. That
+is deliberate: handlers accept the raw body and validate inside, because real OpenStack
+payloads carry a long tail of vendor extensions that a strict signature would reject. For
+endpoint *semantics*, [the official API reference](https://docs.openstack.org/api-ref/) is
+authoritative — this simulator follows those wire formats.
+
 ## The four operating principles
 
 **Stateless polling delays.** No worker threads, no background jobs. Creating a resource
@@ -167,7 +230,7 @@ Two details make it fast and deterministic:
 - `tests/conftest.py` seeds the node, identity, catalog, flavors, images and networks
   through `seed.py` itself, so the fixtures and the shipped seeder cannot drift apart.
 
-## Layout
+## Project structure
 
 ```
 app/api/        one module per service, each exporting a `router`
@@ -180,3 +243,32 @@ main.py         runs every service on one asyncio loop
 seed.py         idempotent seeder (`--reset` to start over)
 tests/          pytest suite (unit + per-service API tests), in-process via httpx
 ```
+
+## Limitations
+
+Worth knowing before you trust it for something:
+
+- **The Terraform OpenStack provider is a design target, not a verified one.**
+  `python-openstackclient` 10.3.0 and the OpenStack SDK are tested end to end; Terraform
+  has not been exercised yet.
+- **No policy enforcement.** Any valid token can do anything inside its own project.
+  Roles are issued and returned in the catalog, but only Swift checks them (to keep one
+  project out of another's account). Do not use this to test RBAC.
+- **Uploaded bytes are gone.** Glance and Swift hash the payload for a correct ETag and
+  then discard it. `GET` on an image returns `204`; `GET` on an object returns the real
+  metadata with an empty body. Anything that reads its data back will fail.
+- **Physics is not simulated.** No NUMA, ballooning, page sharing, fragmentation, CPU
+  contention, IO throughput or network bandwidth. Diagnostics figures are plausible
+  numbers derived from the instance UUID, not measurements. What *is* modelled faithfully
+  is the control plane's accounting — which is what actually breaks integrations.
+- **One of everything.** A single node, region (`RegionOne`), and domain (`Default`).
+  There is no scheduler to test, because there is nowhere else to place an instance.
+- **Generated keypairs are decorative.** Importing a public key works properly; asking
+  Nova to generate one returns synthetic material. There is no VM to log in to either way.
+- **Not for exposure.** Plain HTTP, tokens that are opaque UUIDs rather than Fernet, and
+  a seeded password of `secret`. Bind it to loopback and keep it there.
+- **Services not simulated:** Heat, Barbican, Magnum, Manila, Ironic, Designate, Ceilometer.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
