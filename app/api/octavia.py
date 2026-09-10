@@ -15,12 +15,12 @@ from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import gen_id, iso, now_utc, transition_deadline, transition_done
+from app.core.config import gen_id, iso, now_utc, settle_transition, transition_deadline
 from app.core.database import get_session
-from app.core.middleware import AuthContext, OSPayload, fault, require
+from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
 from app.models.loadbalancer import HealthMonitor, Listener, LoadBalancer, Member, Pool
 from app.models.network import Network, Subnet
-from app.api.neutron import create_port_record
+from app.services.networking import AddressPoolExhausted, create_port_record
 
 SERVICE = "octavia"
 router = APIRouter()
@@ -106,15 +106,12 @@ class HealthMonitorPayload(OSPayload):
 
 def resolve(entity: Any) -> Any:
     """PENDING_CREATE -> ACTIVE (and OFFLINE -> ONLINE) once the deadline elapses."""
-    if entity.transition_until and transition_done(entity.transition_until):
-        target = entity.transition_target or "ACTIVE"
-        entity.provisioning_status = target
+    target = settle_transition(entity, "provisioning_status")
+    if target:
         if isinstance(entity, Member):
             entity.operating_status = "NO_MONITOR" if target == "ACTIVE" else "OFFLINE"
         else:
             entity.operating_status = ONLINE_STATUSES.get(target, "OFFLINE")
-        entity.transition_until = None
-        entity.transition_target = None
         entity.updated_at = now_utc()
     return entity
 
@@ -257,13 +254,6 @@ def monitor_dict(monitor: HealthMonitor) -> dict[str, Any]:
     }
 
 
-def _body(payload: dict[str, Any], key: str) -> dict[str, Any]:
-    value = payload.get(key)
-    if not isinstance(value, dict):
-        raise fault(SERVICE, 400, f"Request body must contain a '{key}' object.")
-    return value
-
-
 async def _get_lb(session: AsyncSession, lb_id: str) -> LoadBalancer:
     lb = await session.get(LoadBalancer, lb_id)
     if lb is None or lb.deleted:
@@ -347,7 +337,7 @@ async def create_loadbalancer(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = LoadBalancerPayload(**_body(body, "loadbalancer"))
+    payload = LoadBalancerPayload(**body_object(SERVICE, body, "loadbalancer"))
     vip_address = payload.vip_address
     vip_port_id: str | None = None
     network_id = payload.vip_network_id
@@ -360,13 +350,16 @@ async def create_loadbalancer(
     if network_id and not vip_address:
         network = await session.get(Network, network_id)
         if network is not None:
-            port = await create_port_record(
-                session,
-                network,
-                auth.project_id,
-                device_owner="Octavia",
-                name=f"octavia-lb-vip-{payload.name or 'lb'}",
-            )
+            try:
+                port = await create_port_record(
+                    session,
+                    network,
+                    auth.project_id,
+                    device_owner="Octavia",
+                    name=f"octavia-lb-vip-{payload.name or 'lb'}",
+                )
+            except AddressPoolExhausted as exc:
+                raise fault(SERVICE, 409, f"Cannot allocate a VIP address: {exc}")
             await session.flush()
             vip_address = port.ip_address
             vip_port_id = port.id
@@ -412,7 +405,7 @@ async def update_loadbalancer(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     lb = await _get_lb(session, lb_id)
-    for key, value in _body(body, "loadbalancer").items():
+    for key, value in body_object(SERVICE, body, "loadbalancer").items():
         if key in ("name", "description", "admin_state_up", "tags"):
             setattr(lb, key, value)
     lb.updated_at = now_utc()
@@ -577,7 +570,7 @@ async def create_listener(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = ListenerPayload(**_body(body, "listener"))
+    payload = ListenerPayload(**body_object(SERVICE, body, "listener"))
     await _get_lb(session, payload.loadbalancer_id)
     listener = Listener(
         id=gen_id(),
@@ -622,7 +615,7 @@ async def update_listener(
     listener = await session.get(Listener, listener_id)
     if listener is None or listener.deleted:
         raise fault(SERVICE, 404, f"Listener {listener_id} not found.")
-    for key, value in _body(body, "listener").items():
+    for key, value in body_object(SERVICE, body, "listener").items():
         if key in ("name", "description", "admin_state_up", "connection_limit",
                    "default_pool_id", "tags"):
             setattr(listener, key, value)
@@ -680,7 +673,7 @@ async def create_pool(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = PoolPayload(**_body(body, "pool"))
+    payload = PoolPayload(**body_object(SERVICE, body, "pool"))
     lb_id = payload.loadbalancer_id
     if not lb_id and payload.listener_id:
         listener = await session.get(Listener, payload.listener_id)
@@ -745,7 +738,7 @@ async def update_pool(
     pool = await session.get(Pool, pool_id)
     if pool is None or pool.deleted:
         raise fault(SERVICE, 404, f"Pool {pool_id} not found.")
-    for key, value in _body(body, "pool").items():
+    for key, value in body_object(SERVICE, body, "pool").items():
         if key in ("name", "description", "admin_state_up", "lb_algorithm",
                    "session_persistence", "tags"):
             setattr(pool, key, value)
@@ -801,7 +794,7 @@ async def create_member(
     pool = await session.get(Pool, pool_id)
     if pool is None or pool.deleted:
         raise fault(SERVICE, 404, f"Pool {pool_id} not found.")
-    payload = MemberPayload(**_body(body, "member"))
+    payload = MemberPayload(**body_object(SERVICE, body, "member"))
     member = Member(
         id=gen_id(),
         name=payload.name,
@@ -849,7 +842,7 @@ async def update_member(
     member = await session.get(Member, member_id)
     if member is None or member.deleted or member.pool_id != pool_id:
         raise fault(SERVICE, 404, f"Member {member_id} not found.")
-    for key, value in _body(body, "member").items():
+    for key, value in body_object(SERVICE, body, "member").items():
         if key in ("name", "weight", "admin_state_up", "backup", "monitor_address",
                    "monitor_port", "tags"):
             setattr(member, key, value)
@@ -900,7 +893,7 @@ async def create_health_monitor(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = HealthMonitorPayload(**_body(body, "healthmonitor"))
+    payload = HealthMonitorPayload(**body_object(SERVICE, body, "healthmonitor"))
     pool = await session.get(Pool, payload.pool_id)
     if pool is None or pool.deleted:
         raise fault(SERVICE, 404, f"Pool {payload.pool_id} not found.")

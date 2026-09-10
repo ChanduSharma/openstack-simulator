@@ -135,18 +135,6 @@ class Settings(BaseModel):
         """Physical thread count -- the un-overcommitted vCPU pool."""
         return self.host_threads
 
-    @property
-    def allocatable_vcpus(self) -> float:
-        return self.total_vcpus * self.cpu_allocation_ratio
-
-    @property
-    def allocatable_ram_mb(self) -> float:
-        return (self.host_ram_mb - self.host_reserved_ram_mb) * self.ram_allocation_ratio
-
-    @property
-    def allocatable_disk_gb(self) -> float:
-        return (self.host_disk_gb - self.host_reserved_disk_gb) * self.disk_allocation_ratio
-
 
 settings = Settings()
 
@@ -276,3 +264,21 @@ def transition_deadline(minimum: int | None = None, maximum: int | None = None) 
 
 def transition_done(deadline: datetime | None) -> bool:
     return deadline is None or now_utc() >= deadline
+
+
+def settle_transition(entity: Any, status_field: str = "status") -> str | None:
+    """Apply a stored transition once its deadline has passed.
+
+    Returns the new status if the entity just became ready (so the caller can apply
+    whatever else that state implies), or None if it is still pending or had no
+    transition armed. Clearing the deadline here is what stops a settled resource from
+    being flipped a second time.
+    """
+    deadline = getattr(entity, "transition_until", None)
+    if deadline is None or not transition_done(deadline):
+        return None
+    target = entity.transition_target or "ACTIVE"
+    entity.transition_until = None
+    entity.transition_target = None
+    setattr(entity, status_field, target)
+    return target

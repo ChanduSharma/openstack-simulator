@@ -27,7 +27,7 @@ from app.models.compute import Flavor, Hypervisor
 from app.models.identity import Endpoint, Project, Role, RoleAssignment, Service, User
 from app.models.network import Network, SecurityGroup, SecurityGroupRule, Subnet
 from app.models.storage import Image, VolumeType
-from app.api.neutron import allocation_pool
+from app.services.networking import allocation_pool
 
 FLAVORS: list[dict[str, Any]] = [
     {"id": "1", "name": "m1.tiny", "vcpus": 1, "ram": 512, "disk": 1},

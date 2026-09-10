@@ -15,8 +15,8 @@ from app.core.config import (
     iso_us,
     now_utc,
     service_url,
+    settle_transition,
     transition_deadline,
-    transition_done,
 )
 from app.core.database import get_session
 from app.core.middleware import AuthContext, OSPayload, fault, require
@@ -113,19 +113,13 @@ class VolumeTypePayload(OSPayload):
 
 def resolve_volume(volume: Volume) -> Volume:
     """creating -> available once the stored transition deadline elapses."""
-    if volume.transition_until and transition_done(volume.transition_until):
-        volume.status = volume.transition_target or "available"
-        volume.transition_until = None
-        volume.transition_target = None
+    if settle_transition(volume):
         volume.updated_at = now_utc()
     return volume
 
 
 def resolve_snapshot(snapshot: Snapshot) -> Snapshot:
-    if snapshot.transition_until and transition_done(snapshot.transition_until):
-        snapshot.status = snapshot.transition_target or "available"
-        snapshot.transition_until = None
-        snapshot.transition_target = None
+    if settle_transition(snapshot):
         snapshot.updated_at = now_utc()
     return snapshot
 

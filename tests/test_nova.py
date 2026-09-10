@@ -532,3 +532,19 @@ async def test_simple_tenant_usage(api, cloud) -> None:
     usage = (await api["nova"].get("/v2.1/os-simple-tenant-usage")).json()["tenant_usages"][0]
     assert usage["tenant_id"] == cloud.project_id
     assert usage["total_hours"] >= 0
+
+
+async def test_boot_reports_address_exhaustion_as_a_nova_error(api) -> None:
+    """A Neutron-layer failure must surface in Nova's own error dialect, not a 500."""
+    network = (await api["neutron"].post("/v2.0/networks",
+                                         json={"network": {"name": "tiny"}})).json()["network"]
+    await api["neutron"].post("/v2.0/subnets", json={
+        "subnet": {"network_id": network["id"], "cidr": "10.99.0.0/30"}})  # one usable IP
+    flavors, images = await _ids(api)
+    body = {"server": {"name": "vm", "flavorRef": flavors["m1.tiny"],
+                       "imageRef": images["cirros"], "networks": [{"uuid": network["id"]}]}}
+    assert (await api["nova"].post("/v2.1/servers", json=body)).status_code == 202
+    second = await api["nova"].post("/v2.1/servers", json=body)
+    assert second.status_code == 400
+    assert "badRequest" in second.json(), "Nova speaks its own error format"
+    assert "fixed IP" in second.json()["badRequest"]["message"]

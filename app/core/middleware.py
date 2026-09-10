@@ -58,46 +58,72 @@ _TITLES: dict[int, str] = {
 }
 
 
+def _nova_style(status: int, message: str, title: str, extra: dict[str, Any]) -> dict[str, Any]:
+    key = _NOVA_KEYS.get(status, "computeFault")
+    body: dict[str, Any] = {key: {"message": message, "code": status}}
+    if extra.get("retry_after"):
+        body[key]["retryAfter"] = extra["retry_after"]
+    return body
+
+
+def _neutron_style(status: int, message: str, title: str, extra: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "NeutronError": {
+            "type": extra.get("type", title.replace(" ", "")),
+            "message": message,
+            "detail": extra.get("detail", ""),
+        }
+    }
+
+
+def _keystone_style(status: int, message: str, title: str, extra: dict[str, Any]) -> dict[str, Any]:
+    return {"error": {"code": status, "title": title, "message": message}}
+
+
+def _placement_style(status: int, message: str, title: str, extra: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "errors": [
+            {
+                "status": status,
+                "title": title,
+                "detail": message,
+                "code": extra.get("code", "placement.undefined_code"),
+                "request_id": extra.get("request_id", ""),
+            }
+        ]
+    }
+
+
+def _octavia_style(status: int, message: str, title: str, extra: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "faultcode": "Client" if status < 500 else "Server",
+        "faultstring": message,
+        "debuginfo": None,
+    }
+
+
+def _glance_style(status: int, message: str, title: str, extra: dict[str, Any]) -> dict[str, Any]:
+    return {"message": message, "code": status, "title": title}
+
+
+# Each service speaks its own error dialect. Adding one means adding an entry here,
+# not editing a growing if/elif chain.
+ERROR_STYLES: dict[str, Callable[[int, str, str, dict[str, Any]], dict[str, Any]]] = {
+    "nova": _nova_style,
+    "cinder": _nova_style,
+    "neutron": _neutron_style,
+    "keystone": _keystone_style,
+    "placement": _placement_style,
+    "octavia": _octavia_style,
+    "glance": _glance_style,
+}
+
+
 def error_body(service: str, status: int, message: str, **extra: Any) -> dict[str, Any]:
     """Render an error payload in the dialect the given service actually speaks."""
     title = _TITLES.get(status, "Error")
-    if service in ("nova", "cinder"):
-        key = _NOVA_KEYS.get(status, "computeFault")
-        body: dict[str, Any] = {key: {"message": message, "code": status}}
-        if extra.get("retry_after"):
-            body[key]["retryAfter"] = extra["retry_after"]
-        return body
-    if service == "neutron":
-        return {
-            "NeutronError": {
-                "type": extra.get("type", title.replace(" ", "")),
-                "message": message,
-                "detail": extra.get("detail", ""),
-            }
-        }
-    if service == "keystone":
-        return {"error": {"code": status, "title": title, "message": message}}
-    if service == "placement":
-        return {
-            "errors": [
-                {
-                    "status": status,
-                    "title": title,
-                    "detail": message,
-                    "code": extra.get("code", "placement.undefined_code"),
-                    "request_id": extra.get("request_id", ""),
-                }
-            ]
-        }
-    if service == "octavia":
-        return {
-            "faultcode": "Client" if status < 500 else "Server",
-            "faultstring": message,
-            "debuginfo": None,
-        }
-    if service == "glance":
-        return {"message": message, "code": status, "title": title}
-    return {"error": {"code": status, "title": title, "message": message}}
+    style = ERROR_STYLES.get(service, _keystone_style)
+    return style(status, message, title, extra)
 
 
 def fault(
@@ -113,6 +139,14 @@ def fault(
         detail=error_body(service, status, message, **extra),
         headers=headers,
     )
+
+
+def body_object(service: str, payload: dict[str, Any], key: str) -> dict[str, Any]:
+    """Unwrap the single top-level object OpenStack bodies wrap their fields in."""
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise fault(service, 400, f"Request body must contain a '{key}' object.")
+    return value
 
 
 # --------------------------------------------------------------------------------------

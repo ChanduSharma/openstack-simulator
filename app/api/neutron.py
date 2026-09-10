@@ -2,7 +2,6 @@
 floating IPs -- with simulated IPAM and conntrack accounting."""
 from __future__ import annotations
 
-import ipaddress
 import random
 from typing import Any
 
@@ -13,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import gen_id, iso_us, now_utc, settings
 from app.core.database import get_session
-from app.core.middleware import AuthContext, OSPayload, fault, require
+from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
 from app.models.network import (
     FloatingIP,
     Network,
@@ -23,132 +22,16 @@ from app.models.network import (
     Subnet,
 )
 from app.services.capacity import CapacityError, check_conntrack_capacity
+from app.services.networking import (
+    AddressPoolExhausted,
+    allocation_pool,
+    create_port_record,
+    next_free_ip,
+)
 
 SERVICE = "neutron"
 router = APIRouter()
 auth_dep = require(SERVICE)
-
-
-# --------------------------------------------------------------------------------------
-# Simulated IPAM / MAC allocation -- reused by Nova and Octavia
-# --------------------------------------------------------------------------------------
-
-
-def gen_mac() -> str:
-    return "fa:16:3e:%02x:%02x:%02x" % (
-        random.randint(0, 255),
-        random.randint(0, 255),
-        random.randint(0, 255),
-    )
-
-
-def allocation_pool(cidr: str) -> tuple[str, str, str]:
-    """(gateway, pool_start, pool_end) using the usual OpenStack convention."""
-    net = ipaddress.ip_network(cidr, strict=False)
-    hosts = list(net.hosts()) if net.num_addresses <= 65536 else None
-    if hosts:
-        gateway = str(hosts[0])
-        # The gateway is never handed out, so the pool starts one past it unless the
-        # network is so small that the gateway is the only address there is.
-        start = str(hosts[1]) if len(hosts) > 1 else str(hosts[0])
-        end = str(hosts[-1])
-    else:  # very large network: derive arithmetically instead of materialising hosts
-        base = int(net.network_address)
-        gateway = str(ipaddress.ip_address(base + 1))
-        start = str(ipaddress.ip_address(base + 2))
-        end = str(ipaddress.ip_address(int(net.broadcast_address) - 1))
-    return gateway, start, end
-
-
-async def next_free_ip(session: AsyncSession, subnet: Subnet) -> str:
-    """Hand out the next address from the pool, skipping anything already bound."""
-    start = int(ipaddress.ip_address(subnet.allocation_start))
-    end = int(ipaddress.ip_address(subnet.allocation_end))
-    taken = set(
-        (
-            await session.execute(
-                select(Port.ip_address).where(Port.subnet_id == subnet.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    taken |= set(
-        (
-            await session.execute(
-                select(FloatingIP.floating_ip_address).where(
-                    FloatingIP.released.is_(False)
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    candidate = start + subnet.next_ip_offset
-    while candidate <= end:
-        address = str(ipaddress.ip_address(candidate))
-        if address not in taken:
-            subnet.next_ip_offset = candidate - start + 1
-            return address
-        candidate += 1
-    raise fault(
-        SERVICE,
-        409,
-        f"No more IP addresses available on subnet {subnet.id}.",
-        type="IpAddressGenerationFailure",
-    )
-
-
-async def pick_network(
-    session: AsyncSession, project_id: str, network_id: str | None = None
-) -> Network | None:
-    """Resolve an explicit network id, else the project's first internal network."""
-    if network_id:
-        return await session.get(Network, network_id)
-    stmt = (
-        select(Network)
-        .where(Network.external.is_(False))
-        .where((Network.project_id == project_id) | (Network.shared.is_(True)))
-        .order_by(Network.created_at)
-        .limit(1)
-    )
-    return (await session.execute(stmt)).scalar_one_or_none()
-
-
-async def create_port_record(
-    session: AsyncSession,
-    network: Network,
-    project_id: str,
-    device_id: str = "",
-    device_owner: str = "",
-    name: str = "",
-    security_group_ids: list[str] | None = None,
-    fixed_ip: str | None = None,
-) -> Port:
-    """Create a port on the network's first subnet with an allocated IP + MAC."""
-    subnet = (
-        await session.execute(
-            select(Subnet).where(Subnet.network_id == network.id).order_by(Subnet.created_at)
-        )
-    ).scalars().first()
-    ip_address = fixed_ip
-    if subnet is not None and ip_address is None:
-        ip_address = await next_free_ip(session, subnet)
-    port = Port(
-        id=gen_id(),
-        name=name,
-        network_id=network.id,
-        subnet_id=subnet.id if subnet else None,
-        project_id=project_id,
-        mac_address=gen_mac(),
-        ip_address=ip_address,
-        device_id=device_id,
-        device_owner=device_owner,
-        security_group_ids=security_group_ids or [],
-        status="ACTIVE" if device_id else "DOWN",
-    )
-    session.add(port)
-    return port
 
 
 # --------------------------------------------------------------------------------------
@@ -382,13 +265,6 @@ def floating_ip_dict(fip: FloatingIP) -> dict[str, Any]:
     }
 
 
-def _body(request_body: dict[str, Any], key: str) -> dict[str, Any]:
-    payload = request_body.get(key)
-    if not isinstance(payload, dict):
-        raise fault(SERVICE, 400, f"Request body must contain a '{key}' object.")
-    return payload
-
-
 # --------------------------------------------------------------------------------------
 # Version discovery
 # --------------------------------------------------------------------------------------
@@ -517,7 +393,7 @@ async def create_network(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = NetworkPayload(**_body(body, "network"))
+    payload = NetworkPayload(**body_object(SERVICE, body, "network"))
     network = Network(
         id=gen_id(),
         name=payload.name or f"net-{gen_id()[:8]}",
@@ -559,7 +435,7 @@ async def update_network(
     if network is None:
         raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
                     type="NetworkNotFound")
-    for key, value in _body(body, "network").items():
+    for key, value in body_object(SERVICE, body, "network").items():
         if key in ("name", "admin_state_up", "shared", "description", "mtu", "tags"):
             setattr(network, key, value)
     network.revision_number += 1
@@ -622,7 +498,7 @@ async def create_subnet(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = SubnetPayload(**_body(body, "subnet"))
+    payload = SubnetPayload(**body_object(SERVICE, body, "subnet"))
     network = await session.get(Network, payload.network_id)
     if network is None:
         raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
@@ -681,7 +557,7 @@ async def update_subnet(
     if subnet is None:
         raise fault(SERVICE, 404, f"Subnet {subnet_id} could not be found.",
                     type="SubnetNotFound")
-    for key, value in _body(body, "subnet").items():
+    for key, value in body_object(SERVICE, body, "subnet").items():
         if key in ("name", "gateway_ip", "enable_dhcp", "dns_nameservers", "description", "tags"):
             setattr(subnet, key, value)
     subnet.revision_number += 1
@@ -736,7 +612,7 @@ async def create_port(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = PortPayload(**_body(body, "port"))
+    payload = PortPayload(**body_object(SERVICE, body, "port"))
     network = await session.get(Network, payload.network_id)
     if network is None:
         raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
@@ -744,16 +620,19 @@ async def create_port(
     fixed_ip = None
     if payload.fixed_ips:
         fixed_ip = payload.fixed_ips[0].get("ip_address")
-    port = await create_port_record(
-        session,
-        network,
-        auth.project_id,
-        device_id=payload.device_id,
-        device_owner=payload.device_owner,
-        name=payload.name,
-        security_group_ids=payload.security_groups,
-        fixed_ip=fixed_ip,
-    )
+    try:
+        port = await create_port_record(
+            session,
+            network,
+            auth.project_id,
+            device_id=payload.device_id,
+            device_owner=payload.device_owner,
+            name=payload.name,
+            security_group_ids=payload.security_groups,
+            fixed_ip=fixed_ip,
+        )
+    except AddressPoolExhausted as exc:
+        raise fault(SERVICE, 409, str(exc), type="IpAddressGenerationFailure")
     port.description = payload.description
     port.admin_state_up = payload.admin_state_up
     await session.commit()
@@ -782,7 +661,7 @@ async def update_port(
     port = await session.get(Port, port_id)
     if port is None:
         raise fault(SERVICE, 404, f"Port {port_id} could not be found.", type="PortNotFound")
-    payload = _body(body, "port")
+    payload = body_object(SERVICE, body, "port")
     for key, value in payload.items():
         if key == "security_groups":
             port.security_group_ids = value
@@ -835,7 +714,7 @@ async def create_security_group(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = SecurityGroupPayload(**_body(body, "security_group"))
+    payload = SecurityGroupPayload(**body_object(SERVICE, body, "security_group"))
     try:
         await check_conntrack_capacity(session, len(DEFAULT_EGRESS))
     except CapacityError as exc:
@@ -889,7 +768,7 @@ async def update_security_group(
     if group is None:
         raise fault(SERVICE, 404, f"Security group {group_id} does not exist.",
                     type="SecurityGroupNotFound")
-    for key, value in _body(body, "security_group").items():
+    for key, value in body_object(SERVICE, body, "security_group").items():
         if key in ("name", "description", "tags"):
             setattr(group, key, value)
     group.revision_number += 1
@@ -935,7 +814,7 @@ async def create_security_group_rule(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = SecurityGroupRulePayload(**_body(body, "security_group_rule"))
+    payload = SecurityGroupRulePayload(**body_object(SERVICE, body, "security_group_rule"))
     group = await session.get(SecurityGroup, payload.security_group_id)
     if group is None:
         raise fault(
@@ -1024,7 +903,7 @@ async def create_floating_ip(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    payload = FloatingIPPayload(**_body(body, "floatingip"))
+    payload = FloatingIPPayload(**body_object(SERVICE, body, "floatingip"))
     network = await session.get(Network, payload.floating_network_id)
     if network is None:
         raise fault(
@@ -1045,7 +924,10 @@ async def create_floating_ip(
             f"Network {network.id} does not contain any IPv4 subnet.",
             type="ExternalIpAddressExhausted",
         )
-    address = payload.floating_ip_address or await next_free_ip(session, subnet)
+    try:
+        address = payload.floating_ip_address or await next_free_ip(session, subnet)
+    except AddressPoolExhausted as exc:
+        raise fault(SERVICE, 409, str(exc), type="IpAddressGenerationFailure")
 
     fixed_ip = payload.fixed_ip_address
     status = "DOWN"
@@ -1097,7 +979,7 @@ async def update_floating_ip(
     if fip is None or fip.released:
         raise fault(SERVICE, 404, f"Floating IP {fip_id} could not be found.",
                     type="FloatingIPNotFound")
-    payload = _body(body, "floatingip")
+    payload = body_object(SERVICE, body, "floatingip")
     if "port_id" in payload:
         port_id = payload["port_id"]
         if port_id:

@@ -13,7 +13,15 @@ async def test_page_renders(raw_clients) -> None:
     body = response.text
     assert "OpenStack-Simulator" in body
     assert "tailwindcss" in body, "styled via the Tailwind CDN"
-    assert "/api/stats" in body, "the page polls the stats endpoint"
+    assert '<script src="/dashboard.js">' in body, "the client script is a real file"
+
+
+async def test_client_script_is_served(raw_clients) -> None:
+    response = await raw_clients["dashboard"].get("/dashboard.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
+    assert "/api/stats" in response.text, "the script polls the stats endpoint"
+    assert "setInterval(refresh, 5000)" in response.text
 
 
 async def test_healthz(raw_clients) -> None:

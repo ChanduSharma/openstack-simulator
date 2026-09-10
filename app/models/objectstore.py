@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.config import gen_id, now_utc
@@ -30,7 +30,6 @@ class Container(Base):
     read_acl: Mapped[str] = mapped_column(String(1024), default="")
     write_acl: Mapped[str] = mapped_column(String(1024), default="")
     storage_policy: Mapped[str] = mapped_column(String(64), default="Policy-0")
-    versions_location: Mapped[str | None] = mapped_column(String(255), nullable=True)
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
@@ -59,8 +58,6 @@ class ObjectMetadata(Base):
     content_type: Mapped[str] = mapped_column(String(255), default="application/octet-stream")
     etag: Mapped[str] = mapped_column(String(64), default="")
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
-    is_slo: Mapped[bool] = mapped_column(Boolean, default=False)
-    chunk_count: Mapped[int] = mapped_column(Integer, default=1)
     last_modified: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 

@@ -21,8 +21,8 @@ from app.core.config import (
     now_utc,
     service_url,
     settings,
+    settle_transition,
     transition_deadline,
-    transition_done,
 )
 from app.core.database import get_session
 from app.core.middleware import AuthContext, OSPayload, fault, require
@@ -37,8 +37,11 @@ from app.services.capacity import (
     get_usage,
 )
 from app.services.rating import BILLABLE_ACTIVE, BILLABLE_IDLE
-from app.api.cinder import resolve_volume
-from app.api.neutron import create_port_record, pick_network
+from app.services.networking import (
+    AddressPoolExhausted,
+    create_port_record,
+    pick_network,
+)
 
 SERVICE = "nova"
 router = APIRouter()
@@ -132,13 +135,9 @@ def _set_state(server: Server, status: str, task_state: str | None = None) -> No
 
 def resolve_server(server: Server) -> Server:
     """Stateless polling: flip pending -> ready once the stored deadline has passed."""
-    if server.transition_until is None:
+    target = settle_transition(server)
+    if target is None:
         return server
-    if not transition_done(server.transition_until):
-        return server
-    target = server.transition_target or "ACTIVE"
-    server.transition_until = None
-    server.transition_target = None
     _set_state(server, target)
     if target == "ACTIVE" and server.launched_at is None:
         server.launched_at = now_utc()
@@ -599,13 +598,16 @@ async def _attach_networks(
     if not specs:  # "auto" or omitted
         network = await pick_network(session, auth.project_id)
         if network is not None:
-            await create_port_record(
-                session,
-                network,
-                auth.project_id,
-                device_id=server.id,
-                device_owner="compute:nova",
-            )
+            try:
+                await create_port_record(
+                    session,
+                    network,
+                    auth.project_id,
+                    device_id=server.id,
+                    device_owner="compute:nova",
+                )
+            except AddressPoolExhausted as exc:
+                raise fault(SERVICE, 400, f"Cannot allocate a fixed IP: {exc}")
         return
 
     for spec in specs:
@@ -620,14 +622,17 @@ async def _attach_networks(
         network = await pick_network(session, auth.project_id, spec.get("uuid"))
         if network is None:
             raise fault(SERVICE, 400, f"Network {spec.get('uuid')} could not be found.")
-        await create_port_record(
-            session,
-            network,
-            auth.project_id,
-            device_id=server.id,
-            device_owner="compute:nova",
-            fixed_ip=spec.get("fixed_ip"),
-        )
+        try:
+            await create_port_record(
+                session,
+                network,
+                auth.project_id,
+                device_id=server.id,
+                device_owner="compute:nova",
+                fixed_ip=spec.get("fixed_ip"),
+            )
+        except AddressPoolExhausted as exc:
+            raise fault(SERVICE, 400, f"Cannot allocate a fixed IP: {exc}")
 
 
 @router.get("/v2.1/servers/{server_id}")
@@ -944,7 +949,7 @@ async def attach_volume(
         raise fault(SERVICE, 404, f"Volume {payload.get('volumeId')} could not be found.")
     # The volume may still read as "creating" if nobody has polled it since its
     # transition window expired; settle that before judging whether it is attachable.
-    resolve_volume(volume)
+    settle_transition(volume)
     if volume.status != "available" and not volume.multiattach:
         raise fault(
             SERVICE,
