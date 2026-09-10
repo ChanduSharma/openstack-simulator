@@ -1,4 +1,4 @@
-# OpenStack-Sim
+# OpenStack-Simulator
 
 A bare-metal-emulating OpenStack API simulator: eleven services on their native ports,
 one Python process, no hypervisor. It models **resource depletion and control-plane
