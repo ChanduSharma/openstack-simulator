@@ -27,7 +27,7 @@ from app.core.config import (
 from app.core.database import get_session
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Flavor, Keypair, Server
-from app.models.network import Network, Port
+from app.models.network import Network, Port, SecurityGroup
 from app.models.storage import Image, Volume, VolumeAttachment
 from app.services import telemetry
 from app.services.capacity import (
@@ -736,6 +736,47 @@ async def server_ips(
     return {"addresses": _addresses(ports.get(server.id, []), networks)}
 
 
+@router.get("/v2.1/servers/{server_id}/os-security-groups")
+async def server_security_groups(
+    server_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    server = await _get_server(session, server_id)
+    names = server.security_group_names or []
+    groups = (
+        await session.execute(
+            select(SecurityGroup).where(
+                SecurityGroup.name.in_(names or [""]),
+                SecurityGroup.project_id == server.project_id,
+            )
+        )
+    ).scalars().all()
+    return {
+        "security_groups": [
+            {
+                "id": g.id,
+                "name": g.name,
+                "description": g.description,
+                "tenant_id": g.project_id,
+                "rules": [
+                    {
+                        "id": r.id,
+                        "ip_protocol": r.protocol,
+                        "from_port": r.port_range_min,
+                        "to_port": r.port_range_max,
+                        "ip_range": {"cidr": r.remote_ip_prefix} if r.remote_ip_prefix else {},
+                        "parent_group_id": g.id,
+                        "group": {},
+                    }
+                    for r in g.rules
+                ],
+            }
+            for g in groups
+        ]
+    }
+
+
 @router.get("/v2.1/servers/{server_id}/os-interface")
 async def server_interfaces(
     server_id: str,
@@ -893,6 +934,40 @@ async def server_action(
             status_code=202,
             headers={"Location": service_url("glance", f"/v2/images/{image.id}")},
         )
+    elif action in ("addSecurityGroup", "removeSecurityGroup"):
+        name = (argument or {}).get("name")
+        group = (
+            await session.execute(
+                select(SecurityGroup).where(
+                    SecurityGroup.name == name,
+                    SecurityGroup.project_id == auth.project_id,
+                )
+            )
+        ).scalars().first()
+        if group is None:
+            raise fault(SERVICE, 404, f"Security group {name} not found.")
+        attached = list(server.security_group_names or [])
+        ports = (
+            await session.execute(select(Port).where(Port.device_id == server.id))
+        ).scalars().all()
+        if action == "addSecurityGroup":
+            if name not in attached:
+                attached.append(name)
+            for port in ports:  # Nova applies the group to the instance's ports
+                if group.id not in (port.security_group_ids or []):
+                    port.security_group_ids = [*(port.security_group_ids or []), group.id]
+        else:
+            if name not in attached:
+                raise fault(
+                    SERVICE, 400, f"Security group {name} is not associated with the instance."
+                )
+            attached.remove(name)
+            for port in ports:
+                port.security_group_ids = [
+                    g for g in (port.security_group_ids or []) if g != group.id
+                ]
+        server.security_group_names = attached
+        server.updated_at = now_utc()
     elif action == "os-resetState":
         _set_state(server, (argument or {}).get("state", "active").upper())
     else:

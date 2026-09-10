@@ -251,9 +251,16 @@ Worth knowing before you trust it for something:
 - **The Terraform OpenStack provider is a design target, not a verified one.**
   `python-openstackclient` 10.3.0 and the OpenStack SDK are tested end to end; Terraform
   has not been exercised yet.
-- **No policy enforcement.** Any valid token can do anything inside its own project.
-  Roles are issued and returned in the catalog, but only Swift checks them (to keep one
-  project out of another's account). Do not use this to test RBAC.
+- **Project isolation yes, RBAC no.** Resources are owned by the project their token was
+  scoped to. Nova, Cinder and Neutron scope reads to the caller's project — another
+  tenant's resource returns `404`, as Neutron does — while shared and external networks
+  stay visible to everyone, and an admin-roled token sees all projects. What is *not*
+  modelled is per-role authorisation: inside its own project, a `reader` token can do
+  everything a `member` or `admin` token can. Use it to test multi-tenancy; do not use it
+  to test policy files.
+- **Glance and Octavia do not scope reads yet.** They stamp the owning project on create,
+  but their listings return every project's images and load balancers. Nova, Cinder,
+  Neutron, Swift and CloudKitty do scope correctly.
 - **Uploaded bytes are gone.** Glance and Swift hash the payload for a correct ETag and
   then discard it. `GET` on an image returns `204`; `GET` on an object returns the real
   metadata with an empty body. Anything that reads its data back will fail.

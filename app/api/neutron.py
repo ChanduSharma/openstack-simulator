@@ -351,6 +351,43 @@ async def quotas(project_id: str, auth: AuthContext = auth_dep) -> dict[str, Any
 
 
 # --------------------------------------------------------------------------------------
+# Tenancy
+# --------------------------------------------------------------------------------------
+
+
+def _requested_project(request: Request) -> str | None:
+    return request.query_params.get("project_id") or request.query_params.get("tenant_id")
+
+
+def scope_to_project(stmt: Any, model: Any, auth: AuthContext, request: Request) -> Any:
+    """Limit a listing to what the caller may see.
+
+    Mirrors Neutron's default policy: a tenant sees its own resources, an admin sees
+    everything, and either can narrow with ?project_id=.
+    """
+    wanted = _requested_project(request)
+    if wanted:
+        return stmt.where(model.project_id == wanted)
+    if auth.is_admin:
+        return stmt
+    return stmt.where(model.project_id == auth.project_id)
+
+
+def visible_to(resource: Any, auth: AuthContext) -> bool:
+    """Networks that are shared or external are visible to every project."""
+    if auth.is_admin or resource.project_id == auth.project_id:
+        return True
+    return bool(getattr(resource, "shared", False) or getattr(resource, "external", False))
+
+
+def ensure_visible(resource: Any, auth: AuthContext, kind: str, resource_id: str) -> None:
+    if not visible_to(resource, auth):
+        # Neutron hides other tenants' resources behind a 404 rather than a 403.
+        raise fault(SERVICE, 404, f"{kind} {resource_id} could not be found.",
+                    type=f"{kind.replace(' ', '')}NotFound")
+
+
+# --------------------------------------------------------------------------------------
 # Networks
 # --------------------------------------------------------------------------------------
 
@@ -372,6 +409,14 @@ async def list_networks(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     stmt = select(Network)
+    if not (_requested_project(request) or auth.is_admin):
+        stmt = stmt.where(
+            (Network.project_id == auth.project_id)
+            | Network.shared.is_(True)
+            | Network.external.is_(True)
+        )
+    elif _requested_project(request):
+        stmt = stmt.where(Network.project_id == _requested_project(request))
     params = request.query_params
     if "name" in params:
         stmt = stmt.where(Network.name == params["name"])
@@ -421,6 +466,7 @@ async def get_network(
     if network is None:
         raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
                     type="NetworkNotFound")
+    ensure_visible(network, auth, "Network", network_id)
     return {"network": network_dict(network, await _subnet_ids(session, network.id))}
 
 
@@ -454,6 +500,7 @@ async def delete_network(
     if network is None:
         raise fault(SERVICE, 404, f"Network {network_id} could not be found.",
                     type="NetworkNotFound")
+    ensure_visible(network, auth, "Network", network_id)
     in_use = (
         await session.execute(
             select(Port).where(Port.network_id == network_id, Port.device_id != "")
@@ -484,6 +531,13 @@ async def list_subnets(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     stmt = select(Subnet)
+    if not auth.is_admin:
+        shared_networks = select(Network.id).where(
+            Network.shared.is_(True) | Network.external.is_(True)
+        )
+        stmt = stmt.where(
+            (Subnet.project_id == auth.project_id) | Subnet.network_id.in_(shared_networks)
+        )
     if "network_id" in request.query_params:
         stmt = stmt.where(Subnet.network_id == request.query_params["network_id"])
     if "name" in request.query_params:
@@ -592,7 +646,7 @@ async def list_ports(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    stmt = select(Port)
+    stmt = scope_to_project(select(Port), Port, auth, request)
     params = request.query_params
     if "device_id" in params:
         stmt = stmt.where(Port.device_id == params["device_id"])
@@ -648,6 +702,7 @@ async def get_port(
     port = await session.get(Port, port_id)
     if port is None:
         raise fault(SERVICE, 404, f"Port {port_id} could not be found.", type="PortNotFound")
+    ensure_visible(port, auth, "Port", port_id)
     return {"port": port_dict(port)}
 
 
@@ -701,7 +756,7 @@ async def list_security_groups(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    stmt = select(SecurityGroup)
+    stmt = scope_to_project(select(SecurityGroup), SecurityGroup, auth, request)
     if "name" in request.query_params:
         stmt = stmt.where(SecurityGroup.name == request.query_params["name"])
     groups = (await session.execute(stmt.order_by(SecurityGroup.created_at))).scalars().all()
@@ -754,6 +809,7 @@ async def get_security_group(
     if group is None:
         raise fault(SERVICE, 404, f"Security group {group_id} does not exist.",
                     type="SecurityGroupNotFound")
+    ensure_visible(group, auth, "Security group", group_id)
     return {"security_group": security_group_dict(group)}
 
 
@@ -787,6 +843,7 @@ async def delete_security_group(
     if group is None:
         raise fault(SERVICE, 404, f"Security group {group_id} does not exist.",
                     type="SecurityGroupNotFound")
+    ensure_visible(group, auth, "Security group", group_id)
     await session.delete(group)  # rules cascade, releasing their conntrack slots
     await session.commit()
     return Response(status_code=204)
@@ -798,7 +855,7 @@ async def list_security_group_rules(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    stmt = select(SecurityGroupRule)
+    stmt = scope_to_project(select(SecurityGroupRule), SecurityGroupRule, auth, request)
     if "security_group_id" in request.query_params:
         stmt = stmt.where(
             SecurityGroupRule.security_group_id
@@ -885,7 +942,9 @@ async def list_floating_ips(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    stmt = select(FloatingIP).where(FloatingIP.released.is_(False))
+    stmt = scope_to_project(
+        select(FloatingIP).where(FloatingIP.released.is_(False)), FloatingIP, auth, request
+    )
     params = request.query_params
     if "port_id" in params:
         stmt = stmt.where(FloatingIP.port_id == params["port_id"])
@@ -964,6 +1023,7 @@ async def get_floating_ip(
     if fip is None or fip.released:
         raise fault(SERVICE, 404, f"Floating IP {fip_id} could not be found.",
                     type="FloatingIPNotFound")
+    ensure_visible(fip, auth, "Floating IP", fip_id)
     return {"floatingip": floating_ip_dict(fip)}
 
 

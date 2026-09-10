@@ -548,3 +548,46 @@ async def test_boot_reports_address_exhaustion_as_a_nova_error(api) -> None:
     assert second.status_code == 400
     assert "badRequest" in second.json(), "Nova speaks its own error format"
     assert "fixed IP" in second.json()["badRequest"]["message"]
+
+
+async def test_security_group_attach_and_detach(api) -> None:
+    server_id = await _boot(api, name="sg-vm")
+    group = (await api["neutron"].post("/v2.0/security-groups",
+                                       json={"security_group": {"name": "web"}})).json()
+    group_id = group["security_group"]["id"]
+
+    added = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                   json={"addSecurityGroup": {"name": "web"}})
+    assert added.status_code == 202
+
+    listed = (await api["nova"].get(f"/v2.1/servers/{server_id}/os-security-groups")).json()
+    # the instance keeps its default group and gains the new one
+    assert {g["name"] for g in listed["security_groups"]} == {"default", "web"}
+    body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+    assert {g["name"] for g in body["security_groups"]} == {"default", "web"}
+
+    # the group is pushed down onto the instance's ports, as Nova does
+    ports = (await api["neutron"].get(f"/v2.0/ports?device_id={server_id}")).json()["ports"]
+    assert group_id in ports[0]["security_groups"]
+
+    removed = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                     json={"removeSecurityGroup": {"name": "web"}})
+    assert removed.status_code == 202
+    ports = (await api["neutron"].get(f"/v2.0/ports?device_id={server_id}")).json()["ports"]
+    assert group_id not in ports[0]["security_groups"]
+
+
+async def test_attaching_an_unknown_group_is_a_404(api) -> None:
+    server_id = await _boot(api)
+    response = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                      json={"addSecurityGroup": {"name": "ghost"}})
+    assert response.status_code == 404
+
+
+async def test_detaching_a_group_that_is_not_attached_is_a_400(api) -> None:
+    server_id = await _boot(api)
+    await api["neutron"].post("/v2.0/security-groups",
+                              json={"security_group": {"name": "unused"}})
+    response = await api["nova"].post(f"/v2.1/servers/{server_id}/action",
+                                      json={"removeSecurityGroup": {"name": "unused"}})
+    assert response.status_code == 400

@@ -342,3 +342,96 @@ async def test_quotas_and_availability_zones(api, cloud) -> None:
 
 async def test_missing_body_object_is_rejected(api) -> None:
     assert (await api["neutron"].post("/v2.0/networks", json={"nope": {}})).status_code == 400
+
+
+# --------------------------------------------------------------------------------------
+# Tenancy: one project must not see another's resources
+# --------------------------------------------------------------------------------------
+
+
+async def _second_project(raw_clients, api, name="tenant-b") -> str:
+    """Create a project + member user and return a token scoped to it."""
+    keystone = api["keystone"]
+    project = (await keystone.post("/v3/projects",
+                                   json={"project": {"name": name}})).json()["project"]
+    user = (await keystone.post("/v3/users", json={"user": {
+        "name": f"{name}-user", "password": "pw",
+        "default_project_id": project["id"]}})).json()["user"]
+    role = (await keystone.get("/v3/roles?name=member")).json()["roles"][0]
+    await keystone.put(f"/v3/projects/{project['id']}/users/{user['id']}/roles/{role['id']}")
+    issued = await raw_clients["keystone"].post("/v3/auth/tokens", json={"auth": {
+        "identity": {"methods": ["password"], "password": {"user": {
+            "name": f"{name}-user", "domain": {"name": "Default"}, "password": "pw"}}},
+        "scope": {"project": {"id": project["id"]}}}})
+    assert "admin" not in [r["name"] for r in issued.json()["token"]["roles"]]
+    return issued.headers["X-Subject-Token"]
+
+
+async def test_security_groups_are_scoped_to_the_project(raw_clients, api) -> None:
+    token = await _second_project(raw_clients, api)
+    other = {"X-Auth-Token": token}
+
+    await api["neutron"].post("/v2.0/security-groups",
+                              json={"security_group": {"name": "admin-only"}})
+    mine = await raw_clients["neutron"].post(
+        "/v2.0/security-groups", json={"security_group": {"name": "tenant-b-sg"}},
+        headers=other)
+    assert mine.status_code == 201
+
+    seen = (await raw_clients["neutron"].get("/v2.0/security-groups",
+                                             headers=other)).json()["security_groups"]
+    names = {g["name"] for g in seen}
+    assert "tenant-b-sg" in names
+    assert "admin-only" not in names, "another project's group must not be listed"
+
+
+async def test_a_tenant_cannot_fetch_another_projects_group(raw_clients, api) -> None:
+    token = await _second_project(raw_clients, api)
+    group = (await api["neutron"].post("/v2.0/security-groups",
+                                       json={"security_group": {"name": "private"}})).json()
+    group_id = group["security_group"]["id"]
+    response = await raw_clients["neutron"].get(f"/v2.0/security-groups/{group_id}",
+                                                headers={"X-Auth-Token": token})
+    assert response.status_code == 404, "hidden behind a 404, as Neutron does"
+    deleted = await raw_clients["neutron"].delete(f"/v2.0/security-groups/{group_id}",
+                                                  headers={"X-Auth-Token": token})
+    assert deleted.status_code == 404
+
+
+async def test_ports_and_floating_ips_are_scoped(raw_clients, api) -> None:
+    token = await _second_project(raw_clients, api)
+    other = {"X-Auth-Token": token}
+    public = (await api["neutron"].get("/v2.0/networks?name=public")).json()["networks"][0]
+    private = (await api["neutron"].get("/v2.0/networks?name=private")).json()["networks"][0]
+    await api["neutron"].post("/v2.0/ports", json={"port": {"network_id": private["id"]}})
+    await api["neutron"].post("/v2.0/floatingips",
+                              json={"floatingip": {"floating_network_id": public["id"]}})
+
+    assert (await raw_clients["neutron"].get("/v2.0/ports", headers=other)).json()["ports"] == []
+    assert (await raw_clients["neutron"].get("/v2.0/floatingips",
+                                             headers=other)).json()["floatingips"] == []
+
+
+async def test_shared_and_external_networks_stay_visible(raw_clients, api) -> None:
+    """A tenant with no networks of its own must still see the shared ones to boot on."""
+    token = await _second_project(raw_clients, api)
+    seen = (await raw_clients["neutron"].get(
+        "/v2.0/networks", headers={"X-Auth-Token": token})).json()["networks"]
+    assert {n["name"] for n in seen} == {"private", "public"}
+
+
+async def test_admin_sees_every_project(raw_clients, api) -> None:
+    token = await _second_project(raw_clients, api)
+    await raw_clients["neutron"].post(
+        "/v2.0/security-groups", json={"security_group": {"name": "tenant-b-sg"}},
+        headers={"X-Auth-Token": token})
+    seen = (await api["neutron"].get("/v2.0/security-groups")).json()["security_groups"]
+    assert "tenant-b-sg" in {g["name"] for g in seen}
+
+
+async def test_project_id_filter_narrows_the_listing(api, cloud) -> None:
+    seen = (await api["neutron"].get(
+        f"/v2.0/security-groups?project_id={cloud.project_id}")).json()["security_groups"]
+    assert all(g["project_id"] == cloud.project_id for g in seen)
+    assert (await api["neutron"].get(
+        "/v2.0/security-groups?project_id=nobody")).json()["security_groups"] == []
