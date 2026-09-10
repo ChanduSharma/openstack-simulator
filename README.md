@@ -14,12 +14,27 @@ Nothing is virtualised. Booting a `m1.medium` deducts 2 vCPU, 4096 + 256 MB of R
 uv venv .venv && uv pip install -r requirements.txt   # or: python -m venv .venv; pip install -r requirements.txt
 .venv/bin/python seed.py --reset                      # node, identity, catalog, flavors, images, networks
 .venv/bin/python main.py                              # all 11 services, one process (~90 MB RSS)
-                                                      # Ctrl-C stops all 11
 
 source openrc.sh                                      # or: cp clouds.yaml ~/.config/openstack/
 openstack server create --flavor m1.small --image cirros --network private vm1
 open http://127.0.0.1:10000/                          # live capacity dashboard
 ```
+
+Ctrl-C stops all eleven services. If you started it in the background:
+
+```bash
+.venv/bin/python main.py --status                     # running? on which ports?
+.venv/bin/python main.py --stop                       # SIGTERM, then wait for a clean exit
+```
+
+## Starting and stopping
+
+`main.py` writes its pid to `openstack-simulator.pid` on start and removes it on exit
+(override the location with `OPENSTACK_SIMULATOR_PID_FILE`). A stale file left by a
+`kill -9` is detected and cleaned up rather than trusted, and the pid is checked against
+`/proc` before any signal is sent, so a recycled pid can never be signalled by mistake.
+Starting a second instance is refused with a clear message instead of eleven
+`Address already in use` errors.
 
 ## Services
 
@@ -105,23 +120,6 @@ OPENSTACK_SIMULATOR_REQUIRE_AUTH=0              # skip tokens for curl-driven de
 ```
 
 `python main.py --service nova --service keystone` runs a subset.
-
-## Starting and stopping
-
-In the foreground, Ctrl-C stops all eleven services at once. When it is running
-detached, use the commands rather than hunting for the pid:
-
-```bash
-.venv/bin/python main.py --status     # running? on which ports?
-.venv/bin/python main.py --stop       # SIGTERM, then wait for a clean exit
-```
-
-`main.py` writes its pid to `openstack-simulator.pid` on start and removes it on exit
-(override the location with `OPENSTACK_SIMULATOR_PID_FILE`). A stale file left by a
-`kill -9` is detected and cleaned up rather than trusted, and the pid is checked against
-`/proc` before any signal is sent, so a recycled pid can never be signalled by mistake.
-Starting a second instance is refused with a clear message instead of eleven
-`Address already in use` errors.
 
 ## Tests
 
