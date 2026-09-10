@@ -1,12 +1,18 @@
-# OpenStack-Simulator
+# OpenStack-Simulator — a lightweight OpenStack API simulator for local development and CI
 
-A bare-metal-emulating OpenStack API simulator: eleven services on their native ports,
-one Python process, no hypervisor. It models **resource depletion and control-plane
-state** so you can develop and test `python-openstackclient`, the OpenStack SDK, and the
-Terraform provider against a cloud that runs on an old laptop.
+Run a full OpenStack control plane on a laptop. Eleven services — Keystone, Nova, Cinder,
+Glance, Neutron, Placement, Octavia, Swift, CloudKitty, a failure-injection API and a live
+dashboard — answer on their **native OpenStack ports** from a single ~90 MB Python process.
+No hypervisor, no virtual machines, no DevStack, no hardware.
 
-Nothing is virtualised. Booting a `m1.medium` deducts 2 vCPU, 4096 + 256 MB of RAM and
-40 GB of disk from a simulated 256 GB node — but starts no QEMU and allocates no memory.
+It is a **DevStack alternative** for the cases DevStack is too heavy for: testing
+`python-openstackclient`, the OpenStack SDK and the Terraform OpenStack provider in CI, on
+an old laptop, or inside a container.
+
+What makes it more than a set of stub endpoints is that it models **bare-metal resource
+depletion and control-plane state**. Nothing is virtualised, but booting a `m1.medium`
+deducts 2 vCPU, 4096 + 256 MB of RAM and 40 GB of disk from a simulated 256 GB node — and
+the node fills up, refuses the next boot, and reports the shortfall exactly as Nova would.
 
 ![The status dashboard on port 10000: live capacity meters for vCPU, RAM, disk and
 conntrack, instances across BUILD / ACTIVE / SHUTOFF / SHELVED_OFFLOADED, attached
@@ -165,6 +171,8 @@ Two details make it fast and deterministic:
 
 ```
 app/api/        one module per service, each exporting a `router`
+app/static/     dashboard markup and client script (plain files, no template engine:
+                the page has no server-side variables -- it renders itself from /api/stats)
 app/core/       config (specs, ratios, rates), async engine, middleware + app factory
 app/models/     typed SQLAlchemy 2.0 models
 app/services/   capacity (depletion), telemetry (diagnostics/console), rating (billing)
