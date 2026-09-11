@@ -18,6 +18,19 @@ the node fills up, refuses the next boot, and reports the shortfall exactly as N
 conntrack, instances across BUILD / ACTIVE / SHUTOFF / SHELVED_OFFLOADED, attached
 volumes, load balancers and on-the-fly rating](docs/dashboard.png)
 
+## What you get
+
+| | |
+| --- | --- |
+| **11 services, one process** | Native OpenStack ports, one asyncio loop, ~90 MB RSS |
+| **Real depletion** | A 256 GB node that actually fills up and refuses the next boot |
+| **Upstream error bodies** | `itemNotFound`, `NeutronError`, swob HTML — the real dialect per service |
+| **Failure injection** | 500s, 503s, 429s, latency, timeouts and quota exhaustion on demand |
+| **On-the-fly billing** | CloudKitty rating computed from SQL aggregates, no collector |
+| **Live dashboard** | Capacity meters, instance states, volumes, LBs and cost on port 10000 |
+| **Persistent state** | SQLite across restarts — or delete the file to start over |
+| **In-process test suite** | 368 tests, no ports bound, fresh schema per test |
+
 ## Quick start
 
 ```bash
@@ -39,6 +52,17 @@ Ctrl-C stops all eleven services. To run it in the background instead:
 ```
 
 ## Starting and stopping
+
+| Command | What it does |
+| --- | --- |
+| `main.py` | run in the foreground, Ctrl-C to stop |
+| `main.py --detach` (`-d`) | run in the background, return once every port answers |
+| `main.py --status` | is it running, and on which ports |
+| `main.py --stop` | SIGTERM, then wait for a clean exit |
+| `main.py --service nova --service keystone` | run a subset |
+| `main.py --log-level info --access-log` | turn the noise up |
+| `main.py --help` | all of the above |
+| `seed.py --reset` | rebuild the node, identity, catalog, flavors, images, networks |
 
 `--detach` re-execs the entry point in its own session, so closing the terminal or
 Ctrl-C'ing the shell that launched it leaves the simulator running. It does not return
@@ -76,6 +100,42 @@ anything is spawned.
 | CloudKitty | 8889 | `/v1` | rating computed per request from SQL aggregates |
 | Scenarios | 8999 | `/v1/scenarios` | failure injection control plane |
 | Dashboard | 10000 | `/` | live capacity bars, instances, volumes, LBs, billing |
+
+## How it compares to DevStack
+
+DevStack gives you a real OpenStack, virtual machines included. This gives you the control
+plane only — which is the part most integrations actually talk to.
+
+| | DevStack | OpenStack-Simulator |
+| --- | --- | --- |
+| Time to first API call | 30+ minutes | seconds |
+| Footprint | several GB, dozens of processes | ~90 MB, one process |
+| Needs a dedicated VM or host | yes | no — runs in a CI container |
+| Boots real VMs | yes, libvirt/QEMU | no, nothing is virtualised |
+| Resource limits | your actual hardware | a modelled node that fills and refuses boots |
+| Inject a 503 from Nova | restart things and hope | one `curl`, expires on its own |
+| Teardown | slow, and not always clean | delete one SQLite file |
+| Tests policy files and RBAC | yes | **no** |
+| Tests scheduling across hosts | yes | **no** — there is one node |
+
+Reach for DevStack when what you are testing *is* OpenStack. Reach for this when what you
+are testing is a **client of** OpenStack — an SDK call, a Terraform plan, a billing
+integration, a retry path — and you want it to run on a laptop or in CI. See
+[Limitations](#limitations) for the full list of what is not modelled.
+
+## Client compatibility
+
+| Client | Status |
+| --- | --- |
+| [`python-openstackclient`](https://docs.openstack.org/python-openstackclient/) 10.3.0 | **verified** — every command in the walkthrough below |
+| [`openstacksdk`](https://docs.openstack.org/openstacksdk/) | **verified** end to end |
+| `curl` / raw HTTP | **verified** — set `OPENSTACK_SIMULATOR_REQUIRE_AUTH=0` to skip tokens |
+| [Terraform OpenStack provider](https://registry.terraform.io/providers/terraform-provider-openstack/openstack/latest) | design target, **not yet exercised** |
+| [gophercloud](https://github.com/gophercloud/gophercloud) | untested |
+
+Anything that speaks the OpenStack wire format should work — the catalog, microversion
+headers and [error bodies](#error-formats) are the real ones. Only the first three rows
+have actually been run, though, and the table says so rather than implying more.
 
 ## Using with the OpenStack CLI
 
