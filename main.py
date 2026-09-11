@@ -10,7 +10,10 @@ import argparse
 import asyncio
 import contextlib
 import os
+import http.client
 import signal
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -106,6 +109,11 @@ PID_FILE = Path(
     os.environ.get("OPENSTACK_SIMULATOR_PID_FILE", "openstack-simulator.pid")
 )
 
+# A detached run has no terminal to print to, so its output goes here instead.
+LOG_FILE = Path(
+    os.environ.get("OPENSTACK_SIMULATOR_LOG_FILE", "openstack-simulator.log")
+)
+
 
 def _process_alive(pid: int) -> bool:
     """True only if the pid exists *and* still looks like this simulator.
@@ -175,6 +183,106 @@ def stop(timeout: float = 15.0) -> int:
     return 1
 
 
+def _probe_host() -> str:
+    """The address to dial when checking whether the detached run is listening."""
+    return "127.0.0.1" if settings.bind_host in ("0.0.0.0", "::", "") else settings.bind_host
+
+
+def _listening(port: int) -> bool:
+    """True if anything at all holds this port."""
+    try:
+        with socket.create_connection((_probe_host(), port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _serving(port: int) -> bool:
+    """True only when the simulator *itself* answers on this port.
+
+    A bare TCP connect would be satisfied by any unrelated process squatting on the
+    port, and we would report a successful start for a child that had already died on
+    ``Address already in use``. Every simulator response carries a request id -- 404s
+    from an unrouted path included -- so asking for one proves who is listening.
+    """
+    connection = http.client.HTTPConnection(_probe_host(), port, timeout=0.5)
+    try:
+        connection.request("GET", "/")
+        return connection.getresponse().getheader("x-openstack-request-id") is not None
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
+def _log_tail(lines: int = 15) -> str:
+    try:
+        return "\n".join(LOG_FILE.read_text(errors="replace").splitlines()[-lines:])
+    except FileNotFoundError:
+        return ""
+
+
+def detach(child_args: list[str], timeout: float = 30.0) -> int:
+    """Re-exec this entry point in its own session and wait for it to start serving.
+
+    Waiting matters: a background start that returns before the ports are bound just
+    moves the race into the caller's script. We block until the last port answers, or
+    until the child dies -- in which case its log is the useful thing to show.
+    """
+    taken = [(name, port) for name, port in PORTS.items() if _listening(port)]
+    if taken:
+        print(
+            "Cannot start: "
+            + ", ".join(f"port {port} ({name})" for name, port in taken)
+            + f" already in use by another process.\n"
+            f"Free {'them' if len(taken) > 1 else 'it'} first, or point the simulator "
+            f"elsewhere with OPENSTACK_SIMULATOR_* settings.",
+            file=sys.stderr,
+        )
+        return 1
+
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("ab") as log:
+        log.write(f"\n=== started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
+        log.flush()
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), *child_args],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            # Its own session, so closing the terminal or Ctrl-C'ing the shell that
+            # launched it does not take the simulator down with it.
+            start_new_session=True,
+        )
+
+    deadline = time.monotonic() + timeout
+    pending = list(PORTS.values())
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            print(
+                f"OpenStack-Simulator exited immediately (status {child.returncode}).",
+                file=sys.stderr,
+            )
+            tail = _log_tail()
+            if tail:
+                print(f"\n{tail}", file=sys.stderr)
+            return 1
+        pending = [port for port in pending if not _serving(port)]
+        if not pending:
+            print(_banner(settings.advertise_host), flush=True)
+            print(f"    detached     pid {child.pid}, logging to {LOG_FILE}")
+            print(f"    stop it      {Path(sys.argv[0]).name} --stop\n")
+            return 0
+        time.sleep(0.1)
+
+    print(
+        f"OpenStack-Simulator did not finish starting within {timeout:g}s "
+        f"({len(pending)} of {len(PORTS)} ports still silent). See {LOG_FILE}.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def status() -> int:
     pid = _read_pid()
     if pid is None:
@@ -191,9 +299,13 @@ def _banner(host: str) -> str:
     width = max(len(name) for name in PORTS)
     for name, port in PORTS.items():
         lines.append(f"    {name.ljust(width)}  http://{host}:{port}")
+    lines.append("")
+    # --service may have left the dashboard out of this run.
+    if "dashboard" in PORTS:
+        lines.append(
+            f"    dashboard   http://{settings.advertise_host}:{PORTS['dashboard']}/"
+        )
     lines += [
-        "",
-        f"    dashboard   http://{settings.advertise_host}:{PORTS['dashboard']}/",
         "    credentials  source openrc.sh   (or: openstack --os-cloud openstack-simulator ...)",
         "",
     ]
@@ -259,6 +371,13 @@ def main(argv: list[str] | None = None) -> int:
         help="run only the named service(s) instead of all of them",
     )
     parser.add_argument(
+        "--detach",
+        "-d",
+        action="store_true",
+        help=f"run in the background and return once every port answers "
+             f"(output goes to {LOG_FILE})",
+    )
+    parser.add_argument(
         "--stop", action="store_true", help="shut down a detached run and exit"
     )
     parser.add_argument(
@@ -284,6 +403,17 @@ def main(argv: list[str] | None = None) -> int:
         for name in list(PORTS):
             if name not in args.service:
                 PORTS.pop(name)
+
+    if args.detach:
+        # PORTS is already narrowed, so the parent waits on exactly the ports the
+        # child will bind. --detach itself is dropped: the child runs in the foreground
+        # of its own session.
+        child_args = ["--log-level", args.log_level]
+        if args.access_log:
+            child_args.append("--access-log")
+        for name in args.service or []:
+            child_args += ["--service", name]
+        return detach(child_args)
 
     try:
         asyncio.run(serve(log_level=args.log_level, access_log=args.access_log))

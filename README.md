@@ -30,21 +30,36 @@ openstack server create --flavor m1.small --image cirros --network private vm1
 open http://127.0.0.1:10000/                          # live capacity dashboard
 ```
 
-Ctrl-C stops all eleven services. If you started it in the background:
+Ctrl-C stops all eleven services. To run it in the background instead:
 
 ```bash
+.venv/bin/python main.py --detach                     # or -d
 .venv/bin/python main.py --status                     # running? on which ports?
 .venv/bin/python main.py --stop                       # SIGTERM, then wait for a clean exit
 ```
 
 ## Starting and stopping
 
+`--detach` re-execs the entry point in its own session, so closing the terminal or
+Ctrl-C'ing the shell that launched it leaves the simulator running. It does not return
+until every port actually answers — a background start that returned earlier would just
+move the startup race into your script:
+
+```bash
+.venv/bin/python main.py --detach && openstack server list   # no sleep needed
+```
+
+If the run dies on the way up, `--detach` exits non-zero and prints the tail of the log
+rather than reporting a success you would only discover later. Output goes to
+`openstack-simulator.log` (`OPENSTACK_SIMULATOR_LOG_FILE`), appended per run.
+
 `main.py` writes its pid to `openstack-simulator.pid` on start and removes it on exit
 (override the location with `OPENSTACK_SIMULATOR_PID_FILE`). A stale file left by a
 `kill -9` is detected and cleaned up rather than trusted, and the pid is checked against
 `/proc` before any signal is sent, so a recycled pid can never be signalled by mistake.
 Starting a second instance is refused with a clear message instead of eleven
-`Address already in use` errors.
+`Address already in use` errors, and a port held by some *other* process is named before
+anything is spawned.
 
 ## Services
 
