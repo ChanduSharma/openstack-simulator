@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from html import escape
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from types import UnionType
@@ -18,7 +19,7 @@ from sqlalchemy import select, update
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 
-from app.core.config import API_VERSIONS, now_utc, settings
+from app.core.config import API_VERSIONS, now_utc, service_url, settings
 from app.core.database import SessionLocal
 from app.models.failure import FailureInjection
 from app.models.identity import Project, Token, User
@@ -106,9 +107,58 @@ def _glance_style(status: int, message: str, title: str, extra: dict[str, Any]) 
     return {"message": message, "code": status, "title": title}
 
 
+# Swift does not serve JSON errors. swob.Response renders a canned HTML body from the
+# status alone -- the reason text is fixed per code and the caller's message never
+# reaches the wire. These are swift/common/swob.py's RESPONSE_REASONS.
+_SWIFT_REASONS: dict[int, tuple[str, str]] = {
+    400: (
+        "Bad Request",
+        "The server could not comply with the request since it is either malformed "
+        "or otherwise incorrect.",
+    ),
+    401: (
+        "Unauthorized",
+        "This server could not verify that you are authorized to access the document "
+        "you requested.",
+    ),
+    403: ("Forbidden", "Access was denied to this resource."),
+    404: ("Not Found", "The resource could not be found."),
+    405: ("Method Not Allowed", "The method is not allowed for this resource."),
+    408: (
+        "Request Timeout",
+        "The server has waited too long for the request to be sent by the client.",
+    ),
+    409: ("Conflict", "There was a conflict when trying to complete your request."),
+    411: ("Length Required", "Content-Length header required."),
+    412: ("Precondition Failed", "A precondition for this request was not met."),
+    413: (
+        "Request Entity Too Large",
+        "The body of your request was too large for this server.",
+    ),
+    416: ("Requested Range Not Satisfiable", "The Range requested is not available."),
+    422: ("Unprocessable Entity", "Unable to process the contained instructions"),
+    429: ("Too Many Requests", "The client has sent too many requests to the server."),
+    500: (
+        "Internal Error",
+        "The server has either erred or is incapable of performing the requested "
+        "operation.",
+    ),
+    501: ("Not Implemented", "The requested method is not implemented by this server."),
+    503: (
+        "Service Unavailable",
+        "The server is currently unavailable. Please try again at a later time.",
+    ),
+}
+
+
+def _swift_style(status: int, message: str, title: str, extra: dict[str, Any]) -> str:
+    reason, explanation = _SWIFT_REASONS.get(status, (title, message))
+    return f"<html><h1>{escape(reason)}</h1><p>{escape(explanation)}</p></html>"
+
+
 # Each service speaks its own error dialect. Adding one means adding an entry here,
 # not editing a growing if/elif chain.
-ERROR_STYLES: dict[str, Callable[[int, str, str, dict[str, Any]], dict[str, Any]]] = {
+ERROR_STYLES: dict[str, Callable[[int, str, str, dict[str, Any]], Any]] = {
     "nova": _nova_style,
     "cinder": _nova_style,
     "neutron": _neutron_style,
@@ -116,14 +166,74 @@ ERROR_STYLES: dict[str, Callable[[int, str, str, dict[str, Any]], dict[str, Any]
     "placement": _placement_style,
     "octavia": _octavia_style,
     "glance": _glance_style,
+    "swift": _swift_style,
 }
 
 
-def error_body(service: str, status: int, message: str, **extra: Any) -> dict[str, Any]:
-    """Render an error payload in the dialect the given service actually speaks."""
+@dataclass(slots=True)
+class ErrorPayload:
+    """A rendered error body and the media type its service serves it as."""
+
+    content: Any
+    media_type: str = "application/json"
+    detail: str = ""
+
+    @property
+    def is_json(self) -> bool:
+        return self.media_type == "application/json"
+
+
+# Everything but Swift serves its errors as JSON.
+MEDIA_TYPES: dict[str, str] = {"swift": "text/html; charset=UTF-8"}
+
+
+def error_payload(service: str, status: int, message: str, **extra: Any) -> ErrorPayload:
+    """Render an error in the dialect the given service actually puts on the wire."""
     title = _TITLES.get(status, "Error")
-    style = ERROR_STYLES.get(service, _keystone_style)
-    return style(status, message, title, extra)
+    if status == 401 and service != "swift":
+        # Every service but Swift runs behind keystonemiddleware, which rejects an
+        # unauthenticated request before it reaches the service's own WSGI app -- so
+        # the 401 on the wire is Keystone's, whichever service was addressed.
+        style = _keystone_style
+    else:
+        style = ERROR_STYLES.get(service, _keystone_style)
+    media_type = MEDIA_TYPES.get(service, "application/json")
+    # A non-JSON dialect has nowhere to put the caller's message (Swift's HTML is canned
+    # per status), so carry it on a header of our own rather than lose it.
+    return ErrorPayload(
+        style(status, message, title, extra),
+        media_type,
+        detail="" if media_type == "application/json" else message,
+    )
+
+
+def error_body(service: str, status: int, message: str, **extra: Any) -> Any:
+    """The error body alone, without the media type it is served as."""
+    return error_payload(service, status, message, **extra).content
+
+
+def error_response(
+    service: str,
+    status: int,
+    message: str,
+    headers: dict[str, str] | None = None,
+    **extra: Any,
+) -> Response:
+    """A ready-to-return response carrying a service-shaped error."""
+    return render_error(error_payload(service, status, message, **extra), status, headers)
+
+
+def render_error(
+    payload: ErrorPayload, status: int, headers: dict[str, str] | None = None
+) -> Response:
+    sent = dict(headers or {})
+    if payload.detail:
+        sent.setdefault("X-OpenStack-Simulator-Detail", payload.detail)
+    if payload.is_json:
+        return JSONResponse(payload.content, status_code=status, headers=sent)
+    return Response(
+        payload.content, status_code=status, media_type=payload.media_type, headers=sent
+    )
 
 
 def fault(
@@ -133,11 +243,30 @@ def fault(
     headers: dict[str, str] | None = None,
     **extra: Any,
 ) -> HTTPException:
-    """Build an HTTPException whose detail is already a service-shaped body."""
+    """Build an HTTPException whose detail is already a service-shaped payload."""
     return HTTPException(
         status_code=status,
-        detail=error_body(service, status, message, **extra),
+        detail=error_payload(service, status, message, **extra),
         headers=headers,
+    )
+
+
+def unauthenticated(service: str, request: Request) -> HTTPException:
+    """The 401 a real deployment answers a missing or expired token with.
+
+    Swift authenticates requests itself and challenges with its own realm; everything
+    else is fronted by keystonemiddleware, which points the client at Keystone.
+    """
+    if service == "swift":
+        parts = request.url.path.split("/")
+        challenge = f'Swift realm="{parts[2] if len(parts) > 2 else "unknown"}"'
+    else:
+        challenge = f'Keystone uri="{service_url("keystone")}"'
+    return fault(
+        service,
+        401,
+        "The request you have made requires authentication.",
+        headers={"WWW-Authenticate": challenge},
     )
 
 
@@ -243,12 +372,7 @@ def auth_dependency(service: str) -> Callable[[Request], Awaitable[AuthContext]]
             request.state.auth = ctx
             return ctx
         if settings.require_auth:
-            raise fault(
-                service,
-                401,
-                "The request you have made requires authentication.",
-                headers={"WWW-Authenticate": "Keystone uri='%s'" % settings.advertise_host},
-            )
+            raise unauthenticated(service, request)
         ctx = await _anonymous_context()
         request.state.auth = ctx
         return ctx
@@ -393,10 +517,8 @@ def _fail_response(
     message: str,
     headers: dict[str, str] | None = None,
     **extra: Any,
-) -> JSONResponse:
-    response = JSONResponse(
-        error_body(service, status, message, **extra), status_code=status
-    )
+) -> Response:
+    response = error_response(service, status, message, **extra)
     response.headers["X-OpenStack-Simulator-Injected"] = "true"
     for key, value in (headers or {}).items():
         response.headers[key] = value
@@ -477,12 +599,12 @@ def create_service_app(service: str, title: str, description: str = "") -> FastA
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException) -> Response:
         detail = exc.detail
-        body = (
+        payload = (
             detail
-            if isinstance(detail, dict)
-            else error_body(service, exc.status_code, str(detail))
+            if isinstance(detail, ErrorPayload)
+            else error_payload(service, exc.status_code, str(detail))
         )
-        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
+        return render_error(payload, exc.status_code, exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(
@@ -491,7 +613,7 @@ def create_service_app(service: str, title: str, description: str = "") -> FastA
         first = exc.errors()[0] if exc.errors() else {}
         location = ".".join(str(p) for p in first.get("loc", ())[1:]) or "body"
         message = f"Invalid input for field '{location}': {first.get('msg', 'invalid')}"
-        return JSONResponse(error_body(service, 400, message), status_code=400)
+        return error_response(service, 400, message)
 
     return app
 

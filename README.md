@@ -125,6 +125,34 @@ payloads carry a long tail of vendor extensions that a strict signature would re
 endpoint *semantics*, [the official API reference](https://docs.openstack.org/api-ref/) is
 authoritative — this simulator follows those wire formats.
 
+## Error formats
+
+Errors are returned in the dialect the real service speaks, not a house style — so a test
+that asserts on an error body against a real cloud sees the same body here.
+
+| Service | Body |
+|---|---|
+| Nova, Cinder | `{"itemNotFound": {"message": ..., "code": 404}}` |
+| Neutron | `{"NeutronError": {"type": "NetworkNotFound", "message": ..., "detail": ""}}` |
+| Keystone | `{"error": {"code": ..., "title": ..., "message": ...}}` |
+| Placement | `{"errors": [{"status", "title", "detail", "code", "request_id"}]}` |
+| Octavia | `{"faultcode": "Client", "faultstring": ..., "debuginfo": null}` |
+| Glance | `{"message": ..., "code": ..., "title": ...}` |
+| Swift | `text/html` — `<html><h1>Not Found</h1><p>The resource could not be found.</p></html>` |
+
+Two cases are not what the addressed service would produce on its own, because in a real
+deployment it never gets the chance:
+
+- **Every 401 is Keystone-shaped.** `keystonemiddleware` sits in front of Nova, Cinder,
+  Neutron, Glance, Placement and Octavia and rejects an unauthenticated request before it
+  reaches the service, so the body is Keystone's and the challenge is
+  `WWW-Authenticate: Keystone uri="http://127.0.0.1:5000"`.
+- **Swift authenticates itself**, so it answers 401 with its own
+  `WWW-Authenticate: Swift realm="AUTH_{project}"` and a swob HTML body.
+
+Swift's HTML is canned per status code and has no room for a message, exactly as upstream.
+The simulator's own explanation is kept on an `X-OpenStack-Simulator-Detail` header.
+
 ## The four operating principles
 
 **Stateless polling delays.** No worker threads, no background jobs. Creating a resource

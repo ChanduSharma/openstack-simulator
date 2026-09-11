@@ -314,7 +314,14 @@ async def _get_server(session: AsyncSession, server_id: str) -> Server:
     return resolve_server(server)
 
 
-async def _resolve_flavor(session: AsyncSession, ref: str | None) -> Flavor:
+async def _resolve_flavor(
+    session: AsyncSession, ref: str | None, missing: int = 400
+) -> Flavor:
+    """Look a flavor up by id, name or href.
+
+    A flavorRef the caller made up is a bad request (400); addressing the flavor
+    resource itself at ``/flavors/{id}`` is a 404, which is how Nova splits it.
+    """
     if not ref:
         raise fault(SERVICE, 400, "Missing flavorRef attribute.")
     ref = ref.rstrip("/").split("/")[-1]
@@ -324,7 +331,7 @@ async def _resolve_flavor(session: AsyncSession, ref: str | None) -> Flavor:
             await session.execute(select(Flavor).where(Flavor.name == ref))
         ).scalar_one_or_none()
     if flavor is None:
-        raise fault(SERVICE, 400, f"Flavor {ref} could not be found.")
+        raise fault(SERVICE, missing, f"Flavor {ref} could not be found.")
     return flavor
 
 
@@ -420,7 +427,7 @@ async def get_flavor(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    flavor = await _resolve_flavor(session, flavor_id)
+    flavor = await _resolve_flavor(session, flavor_id, missing=404)
     return {"flavor": flavor_dict(flavor)}
 
 
@@ -430,7 +437,7 @@ async def flavor_extra_specs(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    flavor = await _resolve_flavor(session, flavor_id)
+    flavor = await _resolve_flavor(session, flavor_id, missing=404)
     return {"extra_specs": dict(flavor.extra_specs or {})}
 
 
@@ -440,7 +447,7 @@ async def delete_flavor(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    flavor = await _resolve_flavor(session, flavor_id)
+    flavor = await _resolve_flavor(session, flavor_id, missing=404)
     await session.delete(flavor)
     await session.commit()
     return Response(status_code=202)

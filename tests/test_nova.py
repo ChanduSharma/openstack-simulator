@@ -56,7 +56,7 @@ async def test_flavor_listing_and_detail(api) -> None:
 async def test_flavor_lookup_by_id_and_name(api) -> None:
     assert (await api["nova"].get("/v2.1/flavors/1")).json()["flavor"]["name"] == "m1.tiny"
     assert (await api["nova"].get("/v2.1/flavors/m1.tiny")).json()["flavor"]["id"] == "1"
-    assert (await api["nova"].get("/v2.1/flavors/nope")).status_code == 400
+    assert (await api["nova"].get("/v2.1/flavors/nope")).status_code == 404
 
 
 async def test_flavor_create_and_delete(api) -> None:
@@ -66,7 +66,7 @@ async def test_flavor_create_and_delete(api) -> None:
     assert created.json()["flavor"]["vcpus"] == 8
     assert (await api["nova"].get("/v2.1/flavors/99/os-extra_specs")).json() == {"extra_specs": {}}
     assert (await api["nova"].delete("/v2.1/flavors/99")).status_code == 202
-    assert (await api["nova"].get("/v2.1/flavors/99")).status_code == 400
+    assert (await api["nova"].get("/v2.1/flavors/99")).status_code == 404
 
 
 # -- boot ------------------------------------------------------------------------------
