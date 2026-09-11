@@ -19,6 +19,7 @@ from sqlalchemy import select, update
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 
+from app import __version__
 from app.core.config import API_VERSIONS, now_utc, service_url, settings
 from app.core.database import SessionLocal
 from app.models.failure import FailureInjection
@@ -562,7 +563,7 @@ def create_service_app(service: str, title: str, description: str = "") -> FastA
             "Request bodies follow the real service's wire format; see "
             "https://docs.openstack.org/api-ref/ for the authoritative reference."
         ),
-        version="1.0.0",
+        version=__version__,
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
@@ -579,6 +580,10 @@ def create_service_app(service: str, title: str, description: str = "") -> FastA
         response.headers.setdefault(
             "x-openstack-request-id", f"req-{random.getrandbits(64):016x}"
         )
+        # No real deployment sends this. It is here so a client that reaches an endpoint
+        # unexpectedly can tell at a glance that it is talking to the simulator, and to
+        # which build of it.
+        response.headers["X-OpenStack-Simulator-Version"] = __version__
         return response
 
     @app.middleware("http")

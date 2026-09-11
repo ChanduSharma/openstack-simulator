@@ -49,16 +49,26 @@ def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
     cursor.close()
 
 
-async def init_db(drop: bool = False) -> None:
-    """Create every table. Imports the model package for its side effects."""
+async def init_db(drop: bool = False) -> Any:
+    """Bring the schema up to date. Imports the model package for its side effects.
+
+    Returns the :class:`~app.core.schema.SchemaState` describing what happened, so the
+    caller can report a migration rather than performing one silently.
+    """
     import app.models as _models  # noqa: F401 - registers every mapper
+
+    # Imported here rather than at module scope: schema.py needs Base from this module.
+    from app.core.schema import METADATA_TABLE, ensure_schema
 
     assert _models  # imported purely for the mapper registrations above
 
     async with engine.begin() as conn:
         if drop:
             await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
+            # Not a mapped table, so drop_all does not know about it.
+            await conn.exec_driver_sql(f"DROP TABLE IF EXISTS {METADATA_TABLE}")
+            await conn.exec_driver_sql("PRAGMA user_version = 0")
+        return await ensure_schema(conn)
 
 
 async def dispose_db() -> None:

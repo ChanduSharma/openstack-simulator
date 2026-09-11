@@ -289,6 +289,61 @@ Actions: `500_error`, `503_error`, `rate_limit` (429 + `Retry-After`), `latency`
 and `probability`. Rules take effect within a second and expire on their own.
 `GET /v1/scenarios/actions` documents them; `DELETE /v1/scenarios` clears everything.
 
+## Versioning
+
+Two numbers move independently, and `main.py --version` reports both:
+
+```
+$ python main.py --version
+OpenStack-Simulator 0.1.0 (database schema v1)
+```
+
+The **project version** lives in one place, `app/__init__.py`, and is read from there by
+the CLI, each service's OpenAPI metadata, and an `X-OpenStack-Simulator-Version` header on
+every response — handy when a client reaches an endpoint unexpectedly and you want to know
+at a glance what it is talking to. Releases follow [semver](https://semver.org/) and are
+recorded in [CHANGELOG.md](CHANGELOG.md).
+
+The **database schema version** is stamped into the SQLite file itself, in
+`PRAGMA user_version`. This matters because `create_all` — which is all the simulator uses
+— creates tables that are missing and never emits `ALTER`. Adding a new model is picked up
+on an existing file automatically; adding a *column* to an existing model would be silently
+ignored, and would surface much later as `no such column` from a live request. So:
+
+| The file says | What happens on startup |
+| --- | --- |
+| nothing yet | tables created and stamped |
+| the current version | started, nothing to do |
+| no version at all | adopted as v1 and stamped — rows are kept |
+| an older version | registered migrations applied in order |
+| an older version, no migration for it | **refused**, naming the remedy |
+| a newer version | **refused**, naming the build that wrote it |
+
+A refusal is a message, not a traceback, and exits non-zero:
+
+```
+This database is at schema v99, but this build only understands v1.
+It was written by OpenStack-Simulator 9.9.9; this is 0.1.0.
+Upgrade the simulator, or start over with:
+    python seed.py --reset
+```
+
+Migrations are declarative — a description and the SQL — registered in
+`app/core/schema.py` under the version they upgrade *from*:
+
+```python
+MIGRATIONS: dict[int, Migration] = {
+    1: Migration(
+        "servers gained a description column",
+        ("ALTER TABLE servers ADD COLUMN description VARCHAR",),
+    ),
+}
+```
+
+Leaving a gap is a deliberate option rather than an oversight: nothing here is precious,
+so for an awkward change it is entirely reasonable to skip the migration and let startup
+tell people to `seed.py --reset`.
+
 ## Configuration
 
 Every knob is an `OPENSTACK_SIMULATOR_*` environment variable — see `app/core/config.py`. Useful ones:
@@ -336,15 +391,18 @@ Two details make it fast and deterministic:
 ## Project structure
 
 ```
+app/__init__.py the project and schema version -- the one place either is written down
 app/api/        one module per service, each exporting a `router`
 app/static/     dashboard markup and client script (plain files, no template engine:
                 the page has no server-side variables -- it renders itself from /api/stats)
-app/core/       config (specs, ratios, rates), async engine, middleware + app factory
+app/core/       config (specs, ratios, rates), async engine, middleware + app factory,
+                schema versioning and migrations
 app/models/     typed SQLAlchemy 2.0 models
 app/services/   capacity (depletion), telemetry (diagnostics/console), rating (billing)
 main.py         runs every service on one asyncio loop
 seed.py         idempotent seeder (`--reset` to start over)
 tests/          pytest suite (unit + per-service API tests), in-process via httpx
+CHANGELOG.md    what changed in each release, and which schema version it ships
 ```
 
 ## Limitations

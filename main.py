@@ -34,9 +34,11 @@ from app.api import (
     scenarios,
     swift,
 )
+from app import SCHEMA_VERSION, __version__
 from app.core.config import PORTS, settings
 from app.core.database import dispose_db, init_db
 from app.core.middleware import create_service_app
+from app.core.schema import SchemaVersionError
 
 
 def build_apps() -> dict[str, ASGIApp]:
@@ -295,7 +297,7 @@ def status() -> int:
 
 
 def _banner(host: str) -> str:
-    lines = ["", "  OpenStack-Simulator is up", ""]
+    lines = ["", f"  OpenStack-Simulator {__version__} is up", ""]
     width = max(len(name) for name in PORTS)
     for name, port in PORTS.items():
         lines.append(f"    {name.ljust(width)}  http://{host}:{port}")
@@ -313,7 +315,10 @@ def _banner(host: str) -> str:
 
 
 async def serve(log_level: str = "info", access_log: bool = False) -> None:
-    await init_db()
+    schema = await init_db()
+    # Worth a line only when something actually happened to the file.
+    if schema.action != "current":
+        print(f"  {schema.summary()}", flush=True)
     apps = build_apps()
 
     servers = [
@@ -383,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--status", action="store_true", help="report whether the simulator is running"
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"OpenStack-Simulator {__version__} (database schema v{SCHEMA_VERSION})",
+    )
     args = parser.parse_args(argv)
 
     if args.stop:
@@ -417,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         asyncio.run(serve(log_level=args.log_level, access_log=args.access_log))
+    except SchemaVersionError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:  # pragma: no cover - interactive path
         pass
     return 0

@@ -22,7 +22,9 @@ from app.core.config import (
     service_url,
     settings,
 )
+from app import SCHEMA_VERSION, __version__
 from app.core.database import SessionLocal, dispose_db, init_db
+from app.core.schema import SchemaVersionError
 from app.models.compute import Flavor, Hypervisor
 from app.models.identity import Endpoint, Project, Role, RoleAssignment, Service, User
 from app.models.network import Network, SecurityGroup, SecurityGroupRule, Subnet
@@ -320,7 +322,7 @@ async def seed_security_group(session: AsyncSession, project_id: str) -> None:
 
 
 async def seed(reset: bool = False) -> None:
-    await init_db(drop=reset)
+    schema = await init_db(drop=reset)
     async with SessionLocal() as session:
         host = await seed_host(session)
         project, user = await seed_identity(session)
@@ -332,7 +334,7 @@ async def seed(reset: bool = False) -> None:
         await seed_security_group(session, project.id)
         await session.commit()
 
-        print("Seeded OpenStack-Simulator")
+        print(f"Seeded OpenStack-Simulator {__version__} ({schema.summary()})")
         print(f"  node          {host.hostname}: {host.sockets} sockets / {host.cores} cores / "
               f"{host.threads} threads")
         print(f"                {host.memory_mb} MB RAM, {host.local_gb} GB disk, "
@@ -354,8 +356,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reset", action="store_true", help="drop every table before seeding"
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"OpenStack-Simulator {__version__} (database schema v{SCHEMA_VERSION})",
+    )
     args = parser.parse_args(argv)
-    asyncio.run(seed(reset=args.reset))
+    try:
+        asyncio.run(seed(reset=args.reset))
+    except SchemaVersionError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 1
     return 0
 
 
