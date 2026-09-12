@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -27,6 +29,60 @@ def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, default))
 
 
+DEFAULT_DATABASE = "openstack_simulator.db"
+
+# Anything before "://" is a scheme, so a value carrying one is already a full url.
+_URL_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+def resolve_database_url(value: str) -> str:
+    """Turn a ``--database`` argument into a SQLAlchemy url.
+
+    Three shapes are accepted, because all three are things people reach for:
+    a full url (``postgresql+asyncpg://...``) is passed through untouched, ``:memory:``
+    becomes an ephemeral database, and anything else is a SQLite file path. A bare name
+    with no extension picks up ``.db``, so ``--database prod`` and ``--database prod.db``
+    land on the same file rather than quietly on two different ones.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError("database must not be empty")
+    if _URL_SCHEME.match(value):
+        return value
+    if value in (":memory:", "memory"):
+        return "sqlite+aiosqlite:///:memory:"
+    path = Path(value).expanduser()
+    if not path.suffix:
+        path = path.with_suffix(".db")
+    return f"sqlite+aiosqlite:///{path}"
+
+
+def database_path(url: str | None = None) -> Path | None:
+    """The file behind a SQLite url, or None for in-memory and non-SQLite databases."""
+    url = settings.database_url if url is None else url
+    if not url.startswith("sqlite") or ":memory:" in url:
+        return None
+    location = url.partition("://")[2].partition("?")[0]
+    # SQLite urls carry the path after the host slot, so "sqlite:///x.db" is relative to
+    # the working directory and "sqlite:////x.db" is the absolute /x.db.
+    return Path(location[1:] if location.startswith("//") else location.lstrip("/"))
+
+
+def database_label(url: str | None = None) -> str:
+    """Short name for whichever database is in use -- for banners and status output.
+
+    Credentials can ride in a non-SQLite url, so those are reported by backend name
+    only rather than echoed to a terminal or a log file.
+    """
+    url = settings.database_url if url is None else url
+    if ":memory:" in url:
+        return ":memory: (nothing is persisted)"
+    path = database_path(url)
+    if path is None:
+        return url.partition("://")[0]
+    return str(path)
+
+
 class Settings(BaseModel):
     """Runtime knobs. Every field can be overridden with an ``OPENSTACK_SIMULATOR_*`` env var."""
 
@@ -37,9 +93,13 @@ class Settings(BaseModel):
     )
 
     # -- persistence ------------------------------------------------------------------
+    # DATABASE_URL is the full SQLAlchemy url; DATABASE is the friendly form ("dev.db",
+    # "~/clouds/prod.db", ":memory:") that --database also accepts. The url wins when
+    # both are set, since it is the more specific of the two.
     database_url: str = Field(
         default_factory=lambda: _env(
-            "OPENSTACK_SIMULATOR_DATABASE_URL", "sqlite+aiosqlite:///./openstack_simulator.db"
+            "OPENSTACK_SIMULATOR_DATABASE_URL",
+            resolve_database_url(_env("OPENSTACK_SIMULATOR_DATABASE", DEFAULT_DATABASE)),
         )
     )
     sql_echo: bool = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_SQL_ECHO", "0") == "1")

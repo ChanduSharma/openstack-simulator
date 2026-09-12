@@ -31,7 +31,7 @@ from sqlalchemy import update  # noqa: E402
 
 import main  # noqa: E402
 from app.core.config import now_utc, settings  # noqa: E402
-from app.core.database import Base, SessionLocal, engine  # noqa: E402
+from app.core.database import Base, SessionLocal, get_engine  # noqa: E402
 from app.core.middleware import invalidate_scenario_cache  # noqa: E402
 from seed import (  # noqa: E402
     seed_catalog,
@@ -72,7 +72,7 @@ def apps() -> dict[str, Any]:
 @pytest.fixture(autouse=True)
 async def fresh_db() -> Any:
     """A clean schema per test, plus deterministic (instant) transitions."""
-    async with engine.begin() as conn:
+    async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     invalidate_scenario_cache()

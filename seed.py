@@ -17,13 +17,14 @@ from app.core.config import (
     CATALOG_LAYOUT,
     DOMAIN_ID,
     PORTS,
+    database_label,
     deterministic_id,
     gen_id,
     service_url,
     settings,
 )
 from app import SCHEMA_VERSION, __version__
-from app.core.database import SessionLocal, dispose_db, init_db
+from app.core.database import SessionLocal, dispose_db, init_db, use_database
 from app.core.schema import SchemaVersionError
 from app.models.compute import Flavor, Hypervisor
 from app.models.identity import Endpoint, Project, Role, RoleAssignment, Service, User
@@ -335,6 +336,7 @@ async def seed(reset: bool = False) -> None:
         await session.commit()
 
         print(f"Seeded OpenStack-Simulator {__version__} ({schema.summary()})")
+        print(f"  database      {database_label()}")
         print(f"  node          {host.hostname}: {host.sockets} sockets / {host.cores} cores / "
               f"{host.threads} threads")
         print(f"                {host.memory_mb} MB RAM, {host.local_gb} GB disk, "
@@ -348,7 +350,19 @@ async def seed(reset: bool = False) -> None:
         print(f"  networks      {settings.private_network_name} ({settings.private_network_cidr}), "
               f"{settings.external_network_name} ({settings.external_network_cidr})")
         print(f"  auth url      {service_url('keystone', '/v3')}")
-    await dispose_db()
+
+
+async def _seed_and_close(reset: bool = False) -> None:
+    """Seeding as a one-shot command: do the work, then let go of the engine.
+
+    ``seed`` itself leaves the engine open, because ``main.py`` calls it in-process to
+    populate an in-memory run -- and disposing there would close the one connection the
+    whole database lives in.
+    """
+    try:
+        await seed(reset=reset)
+    finally:
+        await dispose_db()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -357,13 +371,28 @@ def main(argv: list[str] | None = None) -> int:
         "--reset", action="store_true", help="drop every table before seeding"
     )
     parser.add_argument(
+        "--database",
+        "-D",
+        metavar="PATH",
+        help="database to seed: a SQLite file ('dev.db', 'prod', "
+             "'~/clouds/staging.db'), ':memory:', or a full SQLAlchemy url. Seed each "
+             "environment separately, with the same value you pass to main.py "
+             f"(default: {settings.database_url})",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"OpenStack-Simulator {__version__} (database schema v{SCHEMA_VERSION})",
     )
     args = parser.parse_args(argv)
+    if args.database:
+        try:
+            use_database(args.database)
+        except (ValueError, OSError) as exc:
+            print(f"Cannot use database {args.database!r}: {exc}", file=sys.stderr)
+            return 1
     try:
-        asyncio.run(seed(reset=args.reset))
+        asyncio.run(_seed_and_close(reset=args.reset))
     except SchemaVersionError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1

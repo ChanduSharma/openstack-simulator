@@ -223,3 +223,7 @@ openstack_simulator.db
 openstack_simulator.db-shm
 openstack_simulator.db-wal
 openstack-simulator.pid
+# --database puts one file per environment beside it (dev.db, prod.db, ...)
+*.db
+*.db-shm
+*.db-wal

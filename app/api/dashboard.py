@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import PORTS, iso, now_utc, settings
+from app.core.config import PORTS, database_label, iso, now_utc, settings
 from app.core.database import get_session
 from app.models.compute import Flavor, Server
 from app.models.failure import FailureInjection
@@ -101,6 +101,9 @@ async def stats(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
         "generated_at": iso(now_utc()),
         "host": usage.as_dict(),
         "config": {
+            # Which environment this is: every database binds the same ports, so the
+            # page would otherwise look identical whichever one is loaded.
+            "database": database_label(),
             "cpu_allocation_ratio": settings.cpu_allocation_ratio,
             "ram_allocation_ratio": settings.ram_allocation_ratio,
             "qemu_overhead_mb": settings.qemu_overhead_mb,

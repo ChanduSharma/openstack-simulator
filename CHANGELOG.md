@@ -13,6 +13,20 @@ Two numbers move independently:
 
 ## [Unreleased]
 
+### Added
+
+- `main.py --database` / `seed.py --database` (`-D`), and the matching
+  `OPENSTACK_SIMULATOR_DATABASE` variable, to run against a chosen database file — one
+  per environment, so a `dev.db` and a `prod.db` keep entirely separate clouds. Accepts a
+  SQLite path (a bare name gains `.db`, a missing parent directory is created),
+  `:memory:` for a throwaway cloud that is seeded automatically at startup, or a full
+  SQLAlchemy url. The default database and behaviour are unchanged.
+- The database in use is reported in the startup banner, in `--status` (read back from
+  the pid file, which now records it) and on the dashboard — the ports are identical in
+  every environment, so nothing else distinguishes them.
+- Startup warns when the chosen database has no identity seeded yet, naming the
+  `seed.py --database …` command, instead of leaving every request to fail with `401`.
+
 ## [0.1.0] — 2026-09-11
 
 Database schema **v1**.

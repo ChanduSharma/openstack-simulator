@@ -46,6 +46,9 @@ async function refresh() {
     `${h.host} · ${h.vcpus_total} threads · ${fmt.format(h.ram_total_mb/1024)} GB RAM · ` +
     `${fmt.format(h.disk_total_gb/1024)} TB disk · overcommit ${data.config.cpu_allocation_ratio}x`;
   document.getElementById('updated').textContent = data.generated_at;
+  // Every environment serves on the same ports, so the file name is the only thing on
+  // the page that says which one you are looking at.
+  document.getElementById('database').textContent = data.config.database;
 
   document.getElementById('meters').innerHTML =
     meter('vCPU', h.vcpus_used, h.vcpus_allocatable, h.vcpus_pct, 'vCPU (overcommitted)') +

@@ -35,8 +35,8 @@ from app.api import (
     swift,
 )
 from app import SCHEMA_VERSION, __version__
-from app.core.config import PORTS, settings
-from app.core.database import dispose_db, init_db
+from app.core.config import PORTS, database_label, database_path, settings
+from app.core.database import dispose_db, init_db, use_database
 from app.core.middleware import create_service_app
 from app.core.schema import SchemaVersionError
 
@@ -133,16 +133,29 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-def _read_pid() -> int | None:
+def _read_pidfile() -> tuple[int | None, str]:
+    """The live pid and the database it was started against.
+
+    The database goes in the file because it is the one thing about a detached run you
+    cannot recover by looking at the ports: every environment binds the same ones, so
+    "which one is up" is answered by the file or not at all. An older single-line file
+    still parses, it just has no database to report.
+    """
     try:
-        pid = int(PID_FILE.read_text().strip())
-    except (FileNotFoundError, ValueError):
-        return None
-    return pid if _process_alive(pid) else None
+        lines = PID_FILE.read_text().splitlines()
+        pid = int(lines[0].strip())
+    except (FileNotFoundError, IndexError, ValueError):
+        return None, ""
+    database = lines[1].strip() if len(lines) > 1 else ""
+    return (pid, database) if _process_alive(pid) else (None, "")
+
+
+def _read_pid() -> int | None:
+    return _read_pidfile()[0]
 
 
 def _write_pid() -> None:
-    PID_FILE.write_text(f"{os.getpid()}\n")
+    PID_FILE.write_text(f"{os.getpid()}\n{settings.database_url}\n")
 
 
 def _clear_pid() -> None:
@@ -286,13 +299,15 @@ def detach(child_args: list[str], timeout: float = 30.0) -> int:
 
 
 def status() -> int:
-    pid = _read_pid()
+    pid, database = _read_pidfile()
     if pid is None:
         print("OpenStack-Simulator is not running.")
         return 1
     print(f"OpenStack-Simulator is running (pid {pid}):")
     for name, port in PORTS.items():
         print(f"    {name:<11} http://{settings.advertise_host}:{port}")
+    if database:
+        print(f"    {'database':<11} {database_label(database)}")
     return 0
 
 
@@ -308,10 +323,42 @@ def _banner(host: str) -> str:
             f"    dashboard   http://{settings.advertise_host}:{PORTS['dashboard']}/"
         )
     lines += [
+        f"    database     {database_label()}",
         "    credentials  source openrc.sh   (or: openstack --os-cloud openstack-simulator ...)",
         "",
     ]
     return "\n".join(lines)
+
+
+async def _ensure_seeded() -> None:
+    """Make sure the chosen database has an identity to authenticate against.
+
+    A database that has tables but no admin user answers every request with a 401, which
+    reads as a broken simulator rather than a missing step. An in-memory run can only be
+    seeded from inside this process, so it is seeded here; a file is left alone -- it is
+    the user's environment, and silently writing to it is not ours to do.
+    """
+    from sqlalchemy import func, select
+
+    from app.core.database import SessionLocal
+    from app.models.identity import User
+    from seed import seed
+
+    async with SessionLocal() as session:
+        users = await session.scalar(select(func.count()).select_from(User))
+    if users:
+        return
+    if ":memory:" in settings.database_url:
+        await seed()
+        return
+    # The label is the path for SQLite, and only a backend name for anything else --
+    # which would not be a usable argument, so name the flag rather than a wrong value.
+    target = database_path() or "<the same --database value>"
+    print(
+        f"  {database_label()} has no identity yet -- every request will 401.\n"
+        f"  Seed it with:  python seed.py --database {target}",
+        flush=True,
+    )
 
 
 async def serve(log_level: str = "info", access_log: bool = False) -> None:
@@ -319,6 +366,7 @@ async def serve(log_level: str = "info", access_log: bool = False) -> None:
     # Worth a line only when something actually happened to the file.
     if schema.action != "current":
         print(f"  {schema.summary()}", flush=True)
+    await _ensure_seeded()
     apps = build_apps()
 
     servers = [
@@ -376,6 +424,15 @@ def main(argv: list[str] | None = None) -> int:
         help="run only the named service(s) instead of all of them",
     )
     parser.add_argument(
+        "--database",
+        "-D",
+        metavar="PATH",
+        help="database to run against: a SQLite file ('dev.db', 'prod', "
+             "'~/clouds/staging.db'), ':memory:' for a throwaway cloud, or a full "
+             "SQLAlchemy url. Keeping one file per environment keeps their state "
+             f"separate (default: {settings.database_url})",
+    )
+    parser.add_argument(
         "--detach",
         "-d",
         action="store_true",
@@ -400,10 +457,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         return status()
 
-    running = _read_pid()
+    if args.database:
+        try:
+            use_database(args.database)
+        except (ValueError, OSError) as exc:
+            print(f"Cannot use database {args.database!r}: {exc}", file=sys.stderr)
+            return 1
+
+    running, running_database = _read_pidfile()
     if running is not None:
+        where = f" against {database_label(running_database)}" if running_database else ""
         print(
-            f"OpenStack-Simulator is already running (pid {running}).\n"
+            f"OpenStack-Simulator is already running (pid {running}){where}.\n"
             f"Stop it first:  python main.py --stop",
             file=sys.stderr,
         )
@@ -423,6 +488,9 @@ def main(argv: list[str] | None = None) -> int:
             child_args.append("--access-log")
         for name in args.service or []:
             child_args += ["--service", name]
+        # The resolved url rather than args.database: the child must open exactly the
+        # database the parent reported, whatever shorthand was typed.
+        child_args += ["--database", settings.database_url]
         return detach(child_args)
 
     try:

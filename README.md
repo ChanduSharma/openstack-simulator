@@ -60,9 +60,11 @@ Ctrl-C stops all eleven services. To run it in the background instead:
 | `main.py --status` | is it running, and on which ports |
 | `main.py --stop` | SIGTERM, then wait for a clean exit |
 | `main.py --service nova --service keystone` | run a subset |
+| `main.py --database dev.db` (`-D`) | run against a particular database — one per environment |
 | `main.py --log-level info --access-log` | turn the noise up |
 | `main.py --help` | all of the above |
 | `seed.py --reset` | rebuild the node, identity, catalog, flavors, images, networks |
+| `seed.py --database dev.db` (`-D`) | seed that environment instead of the default one |
 
 `--detach` re-execs the entry point in its own session, so closing the terminal or
 Ctrl-C'ing the shell that launched it leaves the simulator running. It does not return
@@ -84,6 +86,44 @@ rather than reporting a success you would only discover later. Output goes to
 Starting a second instance is refused with a clear message instead of eleven
 `Address already in use` errors, and a port held by some *other* process is named before
 anything is spawned.
+
+## Multiple environments
+
+The whole cloud is one SQLite file, so an environment is a file. `--database` (`-D`)
+picks which one, and everything else — capacity, quotas, instances, billing — follows
+from it:
+
+```bash
+.venv/bin/python seed.py  --database prod.db    # build each environment once
+.venv/bin/python seed.py  --database dev.db
+
+.venv/bin/python main.py --detach --database dev.db     # bring one up
+.venv/bin/python main.py --status                       # says which one is running
+.venv/bin/python main.py --stop
+.venv/bin/python main.py --detach --database prod.db    # same ports, other cloud
+```
+
+Seed each environment with the same value you run it with. The ports are identical in
+every environment — only one can be up at a time — so the database is named in the
+startup banner, in `--status`, and in the top-right corner of the dashboard, which is
+the only way to tell at a glance which cloud you are pointed at.
+
+`--database` takes three shapes:
+
+| Value | Means |
+| --- | --- |
+| `dev.db`, `prod`, `~/clouds/staging.db` | a SQLite file; a bare name gains `.db`, and a missing parent directory is created |
+| `:memory:` | a throwaway cloud, seeded automatically at startup and gone on exit |
+| `postgresql+asyncpg://…` | a full SQLAlchemy url, for a backend other than SQLite |
+
+`OPENSTACK_SIMULATOR_DATABASE` sets the same thing from the environment (as does
+`OPENSTACK_SIMULATOR_DATABASE_URL`, which takes a url only and wins over both). The
+default stays `openstack_simulator.db` in the working directory, so a run with no flag
+behaves exactly as before.
+
+A database that exists but was never seeded has no admin user, so every request would
+come back `401`. Rather than let that look like a broken simulator, startup says so and
+names the command that fixes it.
 
 ## Services
 
@@ -354,6 +394,7 @@ OPENSTACK_SIMULATOR_TRANSITION_MIN=1            # fast transitions for CI
 OPENSTACK_SIMULATOR_TRANSITION_MAX=3
 OPENSTACK_SIMULATOR_HOST_RAM_MB=8192            # emulate a smaller node
 OPENSTACK_SIMULATOR_REQUIRE_AUTH=0              # skip tokens for curl-driven demos
+OPENSTACK_SIMULATOR_DATABASE=dev.db             # which environment to run (see above)
 ```
 
 `python main.py --service nova --service keystone` runs a subset.
